@@ -8,8 +8,9 @@ truth for everything except the active auth file:
 
 - `~/.codex/config.toml` is not rewritten.
 - `~/.codex/history.jsonl`, `sessions/`, `skills/`, and other Codex state stay in place.
-- `auth.json` is the only active file switched.
+- `auth.json` is the only active Codex file switched.
 - Saved profiles live outside Codex under `~/.local/share/ai-auth-switch/`.
+- Hermes/OpenClaw Codex-dependent auth state is synchronized after Codex auth changes.
 
 ## Install From Checkout
 
@@ -54,6 +55,15 @@ ai-auth-switch auth list
 ai-auth-switch auth list codex
 ai-auth-switch auth use codex someone@example.com
 ai-auth-switch auth current codex
+```
+
+After Codex auth is saved, logged in, or switched, `ai-auth-switch` also syncs
+Codex-dependent local tools: Hermes gets `openai-codex` credentials imported
+from the active Codex auth, and OpenClaw is pointed at its Codex CLI default
+profile. You can run that step explicitly too:
+
+```bash
+ai-auth-switch auth sync codex
 ```
 
 On a fresh install, `auth list` can be empty even when Codex is already logged

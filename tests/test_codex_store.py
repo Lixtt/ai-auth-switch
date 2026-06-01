@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +17,7 @@ if str(ROOT) not in sys.path:
 
 from ai_auth_switch.providers.codex import CodexProvider
 from ai_auth_switch.store import AuthStore
+from ai_auth_switch.sync import OPENAI_CODEX_DEFAULT_PROFILE, sync_codex_dependents
 from ai_auth_switch.cli import main as cli_main
 
 
@@ -175,6 +177,117 @@ class CodexStoreTests(unittest.TestCase):
             self.assertIn("not active", output)
             self.assertIn("unmanaged codex auth found", output)
             self.assertIn("person@example.com", output)
+
+
+    def test_sync_codex_dependents_updates_openclaw_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            (codex_home / "auth.json").write_text(
+                json.dumps(
+                    {
+                        "auth_mode": "chatgpt",
+                        "tokens": {
+                            "access_token": fake_jwt(
+                                {
+                                    "exp": 4102444800,
+                                    "https://api.openai.com/profile": {
+                                        "email": "person@example.com"
+                                    },
+                                }
+                            ),
+                            "refresh_token": "rt_test",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            openclaw = root / ".openclaw"
+            agent = openclaw / "agents" / "main" / "agent"
+            agent.mkdir(parents=True)
+            (agent / "auth-profiles.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "profiles": {
+                            OPENAI_CODEX_DEFAULT_PROFILE: {
+                                "type": "oauth",
+                                "provider": "openai-codex",
+                            },
+                            "vllm:default": {"type": "api_key", "provider": "vllm"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (agent / "auth-state.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "order": {"openai-codex": ["openai-codex:old"]},
+                        "lastGood": {"openai-codex": "openai-codex:old"},
+                        "usageStats": {OPENAI_CODEX_DEFAULT_PROFILE: {"errorCount": 3}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            provider = CodexProvider(codex_home=codex_home)
+            results = sync_codex_dependents(
+                provider,
+                sync_hermes=False,
+                restart_openclaw=False,
+                openclaw_state_dir=openclaw,
+            )
+
+            self.assertEqual([result.target for result in results], ["openclaw"])
+            self.assertTrue(results[0].ok)
+            profiles = json.loads((agent / "auth-profiles.json").read_text(encoding="utf-8"))
+            state = json.loads((agent / "auth-state.json").read_text(encoding="utf-8"))
+            self.assertNotIn(OPENAI_CODEX_DEFAULT_PROFILE, profiles["profiles"])
+            self.assertEqual(state["order"]["openai-codex"], [OPENAI_CODEX_DEFAULT_PROFILE])
+            self.assertEqual(state["lastGood"]["openai-codex"], OPENAI_CODEX_DEFAULT_PROFILE)
+            self.assertNotIn(OPENAI_CODEX_DEFAULT_PROFILE, state["usageStats"])
+
+    def test_cli_auth_sync_updates_openclaw_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            (codex_home / "auth.json").write_text(
+                json.dumps({"auth_mode": "chatgpt", "email": "person@example.com"}),
+                encoding="utf-8",
+            )
+
+            openclaw = root / ".openclaw"
+            agent = openclaw / "agents" / "main" / "agent"
+            agent.mkdir(parents=True)
+            (agent / "auth-state.json").write_text(
+                json.dumps({"version": 1, "order": {}, "lastGood": {}}),
+                encoding="utf-8",
+            )
+
+            out = io.StringIO()
+            with mock.patch.dict(os.environ, {"OPENCLAW_STATE_DIR": str(openclaw)}):
+                with contextlib.redirect_stdout(out):
+                    status = cli_main(
+                        [
+                            "--codex-home",
+                            str(codex_home),
+                            "auth",
+                            "sync",
+                            "codex",
+                            "--no-hermes",
+                            "--no-openclaw-restart",
+                        ]
+                    )
+
+            self.assertEqual(status, 0)
+            self.assertIn("openclaw: synced", out.getvalue())
+            state = json.loads((agent / "auth-state.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["lastGood"]["openai-codex"], OPENAI_CODEX_DEFAULT_PROFILE)
 
 
 if __name__ == "__main__":

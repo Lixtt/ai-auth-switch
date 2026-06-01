@@ -12,6 +12,7 @@ from ai_auth_switch import __version__
 from ai_auth_switch.errors import AiAuthSwitchError
 from ai_auth_switch.providers import Provider, get_provider
 from ai_auth_switch.store import AuthStore
+from ai_auth_switch.sync import SyncResult, sync_codex_dependents
 from ai_auth_switch.wrapper import run_with_profile
 
 
@@ -60,6 +61,27 @@ def _auth_hint(provider: Provider) -> str:
         f"unmanaged {provider.id} auth found at {active}{suffix}; run "
         f"`ai-auth-switch auth save {provider.id}` to import it"
     )
+
+
+def _print_sync_results(results: Sequence[SyncResult]) -> None:
+    for result in results:
+        path = f" ({result.path})" if result.path is not None else ""
+        stream = sys.stderr if result.status == "error" else sys.stdout
+        print(
+            f"{result.target}: {result.status}: {result.message}{path}",
+            file=stream,
+        )
+
+
+def _sync_after_auth_change(args: argparse.Namespace, provider: Provider) -> list[SyncResult]:
+    if provider.id != "codex" or getattr(args, "no_dependent_sync", False):
+        return []
+    try:
+        results = sync_codex_dependents(provider)
+    except AiAuthSwitchError as exc:
+        results = [SyncResult(target="dependent-sync", status="error", message=str(exc))]
+    _print_sync_results(results)
+    return results
 
 
 def _cmd_auth_list(args: argparse.Namespace) -> int:
@@ -112,6 +134,7 @@ def _cmd_auth_save(args: argparse.Namespace) -> int:
         profile = store.save_current(provider, args.name)
     print(f"saved {provider.id} auth as {profile.name}")
     print(f"active {provider.id} auth -> {profile.path}")
+    _sync_after_auth_change(args, provider)
     return 0
 
 
@@ -121,7 +144,20 @@ def _cmd_auth_use(args: argparse.Namespace) -> int:
     with store.lock():
         profile = store.activate(provider, args.name)
     print(f"active {provider.id} auth -> {profile.name}")
+    _sync_after_auth_change(args, provider)
     return 0
+
+
+def _cmd_auth_sync(args: argparse.Namespace) -> int:
+    provider = _provider_from_args(args)
+    results = sync_codex_dependents(
+        provider,
+        sync_hermes=not args.no_hermes,
+        sync_openclaw=not args.no_openclaw,
+        restart_openclaw=not args.no_openclaw_restart,
+    )
+    _print_sync_results(results)
+    return 1 if any(not result.ok for result in results) else 0
 
 
 def _cmd_auth_remove(args: argparse.Namespace) -> int:
@@ -183,6 +219,7 @@ def _cmd_auth_login(args: argparse.Namespace) -> int:
 
     print(f"saved {provider.id} login as {profile.name}")
     print(f"active {provider.id} auth -> {profile.path}")
+    _sync_after_auth_change(args, provider)
     return 0
 
 
@@ -204,7 +241,18 @@ def _cmd_run(args: argparse.Namespace) -> int:
     command = _strip_separator(args.command)
     if not command:
         command = list(provider.login_command)
-    return run_with_profile(store, provider, args.name, command)
+
+    def sync_current() -> None:
+        _sync_after_auth_change(args, provider)
+
+    return run_with_profile(
+        store,
+        provider,
+        args.name,
+        command,
+        on_activated=sync_current,
+        on_restored=sync_current,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -220,6 +268,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--codex-home",
         help="Override Codex config directory for the codex provider.",
+    )
+    parser.add_argument(
+        "--no-dependent-sync",
+        action="store_true",
+        help="Do not sync Hermes/OpenClaw after changing active Codex auth.",
     )
 
     subparsers = parser.add_subparsers(dest="command_name", required=True)
@@ -244,6 +297,28 @@ def build_parser() -> argparse.ArgumentParser:
     auth_use.add_argument("provider", choices=SUPPORTED_PROVIDERS)
     auth_use.add_argument("name")
     auth_use.set_defaults(func=_cmd_auth_use)
+
+    auth_sync = auth_sub.add_parser(
+        "sync",
+        help="Sync dependent tool auth from the active provider auth.",
+    )
+    auth_sync.add_argument("provider", choices=SUPPORTED_PROVIDERS)
+    auth_sync.add_argument(
+        "--no-hermes",
+        action="store_true",
+        help="Skip Hermes auth/config sync.",
+    )
+    auth_sync.add_argument(
+        "--no-openclaw",
+        action="store_true",
+        help="Skip OpenClaw auth-state sync.",
+    )
+    auth_sync.add_argument(
+        "--no-openclaw-restart",
+        action="store_true",
+        help="Do not restart openclaw-gateway.service after sync.",
+    )
+    auth_sync.set_defaults(func=_cmd_auth_sync)
 
     auth_login = auth_sub.add_parser("login", help="Run provider login and save the result.")
     auth_login.add_argument("provider", choices=SUPPORTED_PROVIDERS)

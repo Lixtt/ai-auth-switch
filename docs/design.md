@@ -31,6 +31,25 @@ The Codex provider does not modify:
 
 This keeps Codex's own configuration layout intact.
 
+## Dependent Tool Sync
+
+Some local tools intentionally consume the active Codex auth. After Codex auth
+is saved, logged in, switched, or temporarily activated, `ai-auth-switch`
+syncs those dependent tool states:
+
+- Hermes imports the active Codex OAuth tokens into its `openai-codex`
+  provider and selects that provider.
+- OpenClaw is pointed at `openai-codex:default`, which is the Codex CLI auth
+  bridge profile.
+- If `openclaw-gateway.service` is active, it is restarted so the new auth is
+  picked up immediately.
+
+The same operation can be run explicitly:
+
+```bash
+ai-auth-switch auth sync codex
+```
+
 ## Wrapper
 
 The wrapper layer temporarily activates a profile, runs a command, and restores
