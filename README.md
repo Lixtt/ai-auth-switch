@@ -50,10 +50,21 @@ ai-auth-switch auth login codex work
 List and switch profiles:
 
 ```bash
+ai-auth-switch auth list
 ai-auth-switch auth list codex
 ai-auth-switch auth use codex someone@example.com
 ai-auth-switch auth current codex
 ```
+
+On a fresh install, `auth list` can be empty even when Codex is already logged
+in. Import the active Codex auth first:
+
+```bash
+ai-auth-switch auth save codex
+```
+
+If you run as another Unix user, make sure `CODEX_HOME` points at the Codex
+config directory you actually use, or pass `--codex-home /path/to/.codex`.
 
 Run Codex with a profile for the lifetime of one process, then restore the
 previous active auth:

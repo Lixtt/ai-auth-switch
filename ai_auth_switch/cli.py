@@ -15,6 +15,9 @@ from ai_auth_switch.store import AuthStore
 from ai_auth_switch.wrapper import run_with_profile
 
 
+SUPPORTED_PROVIDERS = ["codex"]
+
+
 def _strip_separator(args: Sequence[str]) -> list[str]:
     args = list(args)
     if args and args[0] == "--":
@@ -31,32 +34,75 @@ def _store_from_args(args: argparse.Namespace) -> AuthStore:
     return AuthStore(Path(args.store_dir).expanduser() if args.store_dir else None)
 
 
+def _provider_ids(args: argparse.Namespace) -> list[str]:
+    provider = getattr(args, "provider", None)
+    if provider:
+        return [provider]
+    return SUPPORTED_PROVIDERS
+
+
+def _provider_by_id(provider_id: str, args: argparse.Namespace) -> Provider:
+    codex_home = Path(args.codex_home).expanduser() if args.codex_home else None
+    return get_provider(provider_id, codex_home=codex_home)
+
+
+def _auth_hint(provider: Provider) -> str:
+    active = provider.active_auth_path
+    if not active.exists() and not active.is_symlink():
+        return (
+            f"auth file not found at {active}; set CODEX_HOME or pass "
+            f"--codex-home if {provider.id} uses another config directory"
+        )
+
+    inferred = provider.infer_profile_name(active)
+    suffix = f" ({inferred})" if inferred else ""
+    return (
+        f"unmanaged {provider.id} auth found at {active}{suffix}; run "
+        f"`ai-auth-switch auth save {provider.id}` to import it"
+    )
+
+
 def _cmd_auth_list(args: argparse.Namespace) -> int:
-    provider = _provider_from_args(args)
     store = _store_from_args(args)
+    provider_ids = _provider_ids(args)
     with store.lock():
-        profiles = store.list_profiles(provider)
-    if not profiles:
-        print(f"no {provider.id} profiles")
-        return 0
-    for profile in profiles:
-        mark = "*" if profile.active else " "
-        suffix = " (content match)" if profile.by_content else ""
-        print(f"{mark} {profile.name}{suffix}")
+        for index, provider_id in enumerate(provider_ids):
+            provider = _provider_by_id(provider_id, args)
+            profiles = store.list_profiles(provider)
+            if len(provider_ids) > 1:
+                if index:
+                    print()
+                print(f"{provider.id}:")
+            if not profiles:
+                prefix = "  " if len(provider_ids) > 1 else ""
+                print(f"{prefix}no profiles")
+                print(f"{prefix}{_auth_hint(provider)}")
+                continue
+            for profile in profiles:
+                mark = "*" if profile.active else " "
+                suffix = " (content match)" if profile.by_content else ""
+                prefix = "  " if len(provider_ids) > 1 else ""
+                print(f"{prefix}{mark} {profile.name}{suffix}")
     return 0
 
 
 def _cmd_auth_current(args: argparse.Namespace) -> int:
-    provider = _provider_from_args(args)
     store = _store_from_args(args)
+    provider_ids = _provider_ids(args)
+    missing = False
     with store.lock():
-        current = store.current_profile(provider)
-    if current is None:
-        print("not active")
-        return 1
-    suffix = " (content match)" if current.by_content else ""
-    print(f"{current.name}{suffix}")
-    return 0
+        for provider_id in provider_ids:
+            provider = _provider_by_id(provider_id, args)
+            current = store.current_profile(provider)
+            prefix = f"{provider.id}: " if len(provider_ids) > 1 else ""
+            if current is None:
+                print(f"{prefix}not active")
+                print(f"{prefix}{_auth_hint(provider)}")
+                missing = True
+                continue
+            suffix = " (content match)" if current.by_content else ""
+            print(f"{prefix}{current.name}{suffix}")
+    return 1 if missing else 0
 
 
 def _cmd_auth_save(args: argparse.Namespace) -> int:
@@ -182,36 +228,36 @@ def build_parser() -> argparse.ArgumentParser:
     auth_sub = auth.add_subparsers(dest="auth_command", required=True)
 
     auth_list = auth_sub.add_parser("list", help="List profiles.")
-    auth_list.add_argument("provider", choices=["codex"])
+    auth_list.add_argument("provider", nargs="?", choices=SUPPORTED_PROVIDERS)
     auth_list.set_defaults(func=_cmd_auth_list)
 
     auth_current = auth_sub.add_parser("current", help="Show active profile.")
-    auth_current.add_argument("provider", choices=["codex"])
+    auth_current.add_argument("provider", nargs="?", choices=SUPPORTED_PROVIDERS)
     auth_current.set_defaults(func=_cmd_auth_current)
 
     auth_save = auth_sub.add_parser("save", help="Save the active auth file as a profile.")
-    auth_save.add_argument("provider", choices=["codex"])
+    auth_save.add_argument("provider", choices=SUPPORTED_PROVIDERS)
     auth_save.add_argument("name", nargs="?")
     auth_save.set_defaults(func=_cmd_auth_save)
 
     auth_use = auth_sub.add_parser("use", help="Activate a saved profile.")
-    auth_use.add_argument("provider", choices=["codex"])
+    auth_use.add_argument("provider", choices=SUPPORTED_PROVIDERS)
     auth_use.add_argument("name")
     auth_use.set_defaults(func=_cmd_auth_use)
 
     auth_login = auth_sub.add_parser("login", help="Run provider login and save the result.")
-    auth_login.add_argument("provider", choices=["codex"])
+    auth_login.add_argument("provider", choices=SUPPORTED_PROVIDERS)
     auth_login.add_argument("login_args", nargs=argparse.REMAINDER)
     auth_login.set_defaults(func=_cmd_auth_login)
 
     auth_rename = auth_sub.add_parser("rename", help="Rename a saved profile.")
-    auth_rename.add_argument("provider", choices=["codex"])
+    auth_rename.add_argument("provider", choices=SUPPORTED_PROVIDERS)
     auth_rename.add_argument("old")
     auth_rename.add_argument("new")
     auth_rename.set_defaults(func=_cmd_auth_rename)
 
     auth_remove = auth_sub.add_parser("remove", help="Remove a saved inactive profile.")
-    auth_remove.add_argument("provider", choices=["codex"])
+    auth_remove.add_argument("provider", choices=SUPPORTED_PROVIDERS)
     auth_remove.add_argument("name")
     auth_remove.set_defaults(func=_cmd_auth_remove)
 
@@ -219,7 +265,7 @@ def build_parser() -> argparse.ArgumentParser:
         "run",
         help="Run a command under a profile, then restore the previous active auth.",
     )
-    run.add_argument("provider", choices=["codex"])
+    run.add_argument("provider", choices=SUPPORTED_PROVIDERS)
     run.add_argument("name")
     run.add_argument("command", nargs=argparse.REMAINDER)
     run.set_defaults(func=_cmd_run)

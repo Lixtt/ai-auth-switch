@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import contextlib
+import io
 import json
 import os
 import sys
@@ -14,6 +16,7 @@ if str(ROOT) not in sys.path:
 
 from ai_auth_switch.providers.codex import CodexProvider
 from ai_auth_switch.store import AuthStore
+from ai_auth_switch.cli import main as cli_main
 
 
 def fake_jwt(payload: dict) -> str:
@@ -116,6 +119,62 @@ class CodexStoreTests(unittest.TestCase):
             profile_path = store.profile_path(provider, "a@example.com")
             refreshed = json.loads(profile_path.read_text(encoding="utf-8"))
             self.assertTrue(refreshed["refreshed"])
+
+    def test_cli_list_without_provider_prints_codex_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            store_dir = root / "store"
+            codex_home.mkdir()
+
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                status = cli_main(
+                    [
+                        "--store-dir",
+                        str(store_dir),
+                        "--codex-home",
+                        str(codex_home),
+                        "auth",
+                        "list",
+                    ]
+                )
+
+            self.assertEqual(status, 0)
+            output = out.getvalue()
+            self.assertIn("no profiles", output)
+            self.assertIn(f"auth file not found at {codex_home / 'auth.json'}", output)
+
+    def test_cli_current_reports_unmanaged_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            store_dir = root / "store"
+            codex_home.mkdir()
+            (codex_home / "auth.json").write_text(
+                json.dumps({"auth_mode": "chatgpt", "email": "person@example.com"}),
+                encoding="utf-8",
+            )
+
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                status = cli_main(
+                    [
+                        "--store-dir",
+                        str(store_dir),
+                        "--codex-home",
+                        str(codex_home),
+                        "auth",
+                        "current",
+                        "codex",
+                    ]
+                )
+
+            self.assertEqual(status, 1)
+            output = out.getvalue()
+            self.assertIn("not active", output)
+            self.assertIn("unmanaged codex auth found", output)
+            self.assertIn("person@example.com", output)
 
 
 if __name__ == "__main__":
