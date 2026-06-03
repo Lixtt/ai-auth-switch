@@ -175,6 +175,13 @@ class AuthStore:
                         )
                 except OSError:
                     continue
+        identity_match = self._profile_matching_active_identity(provider, active)
+        if identity_match is not None:
+            return ProfileInfo(
+                name=identity_match.stem,
+                path=identity_match,
+                active=True,
+            )
         return None
 
     def save_current(self, provider: Provider, name: str | None = None) -> ProfileInfo:
@@ -213,6 +220,8 @@ class AuthStore:
         active = provider.active_auth_path
         active.parent.mkdir(parents=True, exist_ok=True)
         set_private_permissions(active.parent)
+
+        self._sync_replaced_active_back_to_profile(provider)
 
         if backup_existing:
             self._backup_active_if_needed(provider, replacing_with=path)
@@ -288,6 +297,35 @@ class AuthStore:
         backup = backup_root / f"auth-{stamp}-{time.time_ns()}.json"
         shutil.copyfile(active, backup, follow_symlinks=True)
         set_private_permissions(backup)
+
+    def _sync_replaced_active_back_to_profile(self, provider: Provider) -> None:
+        active = provider.active_auth_path
+        if not active.exists() or active.is_symlink():
+            return
+
+        path = self._profile_matching_active_identity(provider, active)
+        if path is None:
+            return
+        self._sync_active_back_to_profile_if_replaced(active, path)
+
+    def _profile_matching_active_identity(self, provider: Provider, active: Path) -> Path | None:
+        try:
+            active_identity = provider.auth_identity(active)
+        except OSError:
+            return None
+        if not active_identity:
+            return None
+
+        root = self.provider_dir(provider)
+        if not root.exists():
+            return None
+        for path in sorted(root.glob("*.json")):
+            try:
+                if provider.auth_identity(path) == active_identity:
+                    return path
+            except OSError:
+                continue
+        return None
 
     def _sync_active_back_to_profile_if_replaced(self, active: Path, profile_path: Path) -> None:
         if not active.exists():

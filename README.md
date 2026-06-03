@@ -10,7 +10,7 @@ truth for everything except the active auth file:
 - `~/.codex/history.jsonl`, `sessions/`, `skills/`, and other Codex state stay in place.
 - `auth.json` is the only active Codex file switched.
 - Saved profiles live outside Codex under `~/.local/share/ai-auth-switch/`.
-- Hermes/OpenClaw Codex-dependent auth state is synchronized after Codex auth changes.
+- OpenClaw Codex-dependent auth state is synchronized after Codex auth changes.
 
 ## Install From Checkout
 
@@ -58,13 +58,28 @@ ai-auth-switch auth current codex
 ```
 
 After Codex auth is saved, logged in, or switched, `ai-auth-switch` also syncs
-Codex-dependent local tools: Hermes gets `openai-codex` credentials imported
-from the active Codex auth, and OpenClaw is pointed at its Codex CLI default
+Codex-dependent local tools: OpenClaw is pointed at its Codex CLI default
 profile. You can run that step explicitly too:
 
 ```bash
 ai-auth-switch auth sync codex
 ```
+
+Hermes should use its own Codex login instead of sharing the Codex CLI refresh
+token. Sharing that token can trigger refresh-token reuse detection.
+
+If Codex reports that a refresh token was already used after switching
+profiles, that profile's stored refresh token has already been invalidated by
+the server. Log in to that Codex account again and save it back into the same
+profile name:
+
+```bash
+ai-auth-switch auth login codex <profile>
+```
+
+Recent versions sync Codex's atomically replaced `auth.json` back into the
+managed profile before switching away, which prevents reactivating a stale
+refresh token after Codex refreshes it.
 
 On a fresh install, `auth list` can be empty even when Codex is already logged
 in. Import the active Codex auth first:

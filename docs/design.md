@@ -20,6 +20,11 @@ with a symlink to the selected profile. The symlink matters because Codex can
 refresh OAuth tokens while running; refresh writes then update the selected
 profile instead of a detached copy.
 
+Some Codex versions refresh by atomically replacing `auth.json`, which can
+break the symlink. Before switching away, `ai-auth-switch` matches the active
+auth file back to a saved profile by stable Codex account identity and syncs
+the replacement file into that profile.
+
 The Codex provider does not modify:
 
 - `config.toml`
@@ -37,12 +42,16 @@ Some local tools intentionally consume the active Codex auth. After Codex auth
 is saved, logged in, switched, or temporarily activated, `ai-auth-switch`
 syncs those dependent tool states:
 
-- Hermes imports the active Codex OAuth tokens into its `openai-codex`
-  provider and selects that provider.
 - OpenClaw is pointed at `openai-codex:default`, which is the Codex CLI auth
   bridge profile.
 - If `openclaw-gateway.service` is active, it is restarted so the new auth is
   picked up immediately.
+
+Hermes is deliberately not synchronized from Codex CLI tokens by default.
+OpenAI Codex refresh tokens are single-use/rotating credentials; if both Codex
+CLI and Hermes refresh the same imported token, one side can hit
+refresh-token-reuse errors. Hermes should perform its own Codex login so it has
+an independent OAuth session.
 
 The same operation can be run explicitly:
 

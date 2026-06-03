@@ -122,6 +122,52 @@ class CodexStoreTests(unittest.TestCase):
             refreshed = json.loads(profile_path.read_text(encoding="utf-8"))
             self.assertTrue(refreshed["refreshed"])
 
+    def test_permanent_activation_syncs_replaced_active_auth_back_by_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            provider = CodexProvider(codex_home=codex_home)
+            store = AuthStore(root / "store")
+
+            for name in ("a@example.com", "b@example.com"):
+                active = codex_home / "auth.json"
+                if active.exists() or active.is_symlink():
+                    active.unlink()
+                active.write_text(
+                    json.dumps({"auth_mode": "chatgpt", "email": name}),
+                    encoding="utf-8",
+                )
+                with store.lock():
+                    store.save_current(provider, name)
+
+            active = codex_home / "auth.json"
+            with store.lock():
+                store.activate(provider, "a@example.com")
+
+            # Codex may refresh by atomically replacing auth.json, which breaks
+            # the profile symlink. The next switch must not leave profile "a"
+            # with the old refresh token.
+            active.unlink()
+            active.write_text(
+                json.dumps(
+                    {"auth_mode": "chatgpt", "email": "a@example.com", "refreshed": True}
+                ),
+                encoding="utf-8",
+            )
+
+            with store.lock():
+                current = store.current_profile(provider)
+                self.assertIsNotNone(current)
+                self.assertEqual(current.name, "a@example.com")
+                store.activate(provider, "b@example.com")
+
+            profile_path = store.profile_path(provider, "a@example.com")
+            refreshed = json.loads(profile_path.read_text(encoding="utf-8"))
+            self.assertTrue(refreshed["refreshed"])
+            self.assertTrue(active.is_symlink())
+            self.assertEqual(active.resolve(), store.profile_path(provider, "b@example.com"))
+
     def test_cli_list_without_provider_prints_codex_hint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -279,13 +325,13 @@ class CodexStoreTests(unittest.TestCase):
                             "auth",
                             "sync",
                             "codex",
-                            "--no-hermes",
                             "--no-openclaw-restart",
                         ]
                     )
 
             self.assertEqual(status, 0)
             self.assertIn("openclaw: synced", out.getvalue())
+            self.assertNotIn("hermes:", out.getvalue())
             state = json.loads((agent / "auth-state.json").read_text(encoding="utf-8"))
             self.assertEqual(state["lastGood"]["openai-codex"], OPENAI_CODEX_DEFAULT_PROFILE)
 

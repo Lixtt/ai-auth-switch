@@ -19,3 +19,7 @@ class Provider:
 
     def infer_profile_name(self, auth_file: Path) -> str | None:
         return None
+
+    def auth_identity(self, auth_file: Path) -> str | None:
+        """Return a stable account identity for matching refreshed auth files."""
+        return None

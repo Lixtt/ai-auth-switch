@@ -108,7 +108,7 @@ def _summarize_codex_auth(auth_path: Path) -> dict[str, Any]:
 def sync_codex_dependents(
     provider: Provider,
     *,
-    sync_hermes: bool = True,
+    sync_hermes: bool = False,
     sync_openclaw: bool = True,
     restart_openclaw: bool = True,
     hermes_agent_dir: Path | None = None,
@@ -137,6 +137,16 @@ def _sync_hermes_from_codex(
     *,
     hermes_agent_dir: Path | None = None,
 ) -> SyncResult:
+    if os.environ.get("AI_AUTH_SWITCH_UNSAFE_IMPORT_HERMES_CODEX_TOKENS") != "1":
+        return SyncResult(
+            target="hermes",
+            status="skipped",
+            message=(
+                "Codex token import is disabled to avoid refresh-token reuse; "
+                "use Hermes's own Codex login instead"
+            ),
+        )
+
     home = Path.home()
     configured_agent_dir = os.environ.get("HERMES_AGENT_DIR", "").strip()
     if hermes_agent_dir is not None:

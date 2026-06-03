@@ -152,7 +152,7 @@ def _cmd_auth_sync(args: argparse.Namespace) -> int:
     provider = _provider_from_args(args)
     results = sync_codex_dependents(
         provider,
-        sync_hermes=not args.no_hermes,
+        sync_hermes=args.hermes,
         sync_openclaw=not args.no_openclaw,
         restart_openclaw=not args.no_openclaw_restart,
     )
@@ -304,9 +304,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     auth_sync.add_argument("provider", choices=SUPPORTED_PROVIDERS)
     auth_sync.add_argument(
-        "--no-hermes",
+        "--hermes",
         action="store_true",
-        help="Skip Hermes auth/config sync.",
+        help=(
+            "Also import Codex CLI tokens into Hermes. This can conflict with "
+            "refresh-token rotation and requires "
+            "AI_AUTH_SWITCH_UNSAFE_IMPORT_HERMES_CODEX_TOKENS=1."
+        ),
     )
     auth_sync.add_argument(
         "--no-openclaw",

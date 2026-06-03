@@ -104,6 +104,40 @@ class CodexProvider(Provider):
             login_command=login_command or default_codex_command(),
         )
 
+    def auth_identity(self, auth_file: Path) -> str | None:
+        data = _read_json(auth_file)
+        tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+
+        for candidate in (
+            _nested_string(data, "email"),
+            _nested_string(data, "account", "email"),
+            _nested_string(tokens, "email"),
+            _nested_string(tokens, "user_email"),
+            _nested_string(tokens, "account_email"),
+        ):
+            if candidate:
+                return f"email:{candidate.lower()}"
+
+        for token_key in ("id_token", "access_token"):
+            token = tokens.get(token_key)
+            if isinstance(token, str):
+                email = _extract_email_from_jwt(token)
+                if email:
+                    return f"email:{email.lower()}"
+
+        account = _nested_string(tokens, "account_id") or _nested_string(data, "account_id")
+        if not account:
+            for token_key in ("id_token", "access_token"):
+                token = tokens.get(token_key)
+                if isinstance(token, str):
+                    account = _extract_account_id_from_jwt(token)
+                    if account:
+                        break
+        if account:
+            return f"account:{account}"
+
+        return None
+
     def infer_profile_name(self, auth_file: Path) -> str | None:
         data = _read_json(auth_file)
         tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
