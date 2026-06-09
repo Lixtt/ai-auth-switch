@@ -10,7 +10,8 @@ truth for everything except the active auth file:
 - `~/.codex/history.jsonl`, `sessions/`, `skills/`, and other Codex state stay in place.
 - `auth.json` is the only active Codex file switched.
 - Saved profiles live outside Codex under `~/.local/share/ai-auth-switch/`.
-- OpenClaw Codex-dependent auth state is synchronized after Codex auth changes.
+- Hermes and OpenClaw Codex-dependent auth state is synchronized after Codex
+  auth changes.
 
 ## Install From Checkout
 
@@ -58,15 +59,36 @@ ai-auth-switch auth current codex
 ```
 
 After Codex auth is saved, logged in, or switched, `ai-auth-switch` also syncs
-Codex-dependent local tools: OpenClaw is pointed at its Codex CLI default
-profile. You can run that step explicitly too:
+Codex-dependent local tools:
+
+- Hermes is switched to the independent Hermes Codex session saved for the
+  active Codex profile.
+- OpenClaw is pointed at its Codex CLI default profile.
+
+You can run that step explicitly too:
 
 ```bash
 ai-auth-switch auth sync codex
 ```
 
-Hermes should use its own Codex login instead of sharing the Codex CLI refresh
-token. Sharing that token can trigger refresh-token reuse detection.
+`ai-auth-switch auth login codex` also runs Hermes's own Codex device-code
+login for the same profile. That creates a separate Hermes OAuth session under:
+
+```text
+~/.local/share/ai-auth-switch/dependent-auth/hermes/codex/<profile>.json
+```
+
+Hermes does not import or share the Codex CLI refresh token. Codex, Hermes, and
+OpenClaw can refresh their own auth state without rotating the same refresh
+token out from under another tool.
+
+If a Codex profile was created before Hermes sync existed, add the Hermes
+session once:
+
+```bash
+ai-auth-switch auth use codex <profile>
+ai-auth-switch auth sync codex --hermes-login
+```
 
 If Codex reports that a refresh token was already used after switching
 profiles, that profile's stored refresh token has already been invalidated by
@@ -126,9 +148,11 @@ AI_AUTH_SWITCH_HOME=/secure/path ai-auth-switch auth list codex
 
 ## Architecture
 
-`ai-auth-switch` has two separate layers:
+`ai-auth-switch` has three separate layers:
 
 - Auth management: save, list, activate, rename, remove, and inspect profiles.
+- Dependent sync: activate each profile's independent Hermes Codex session and
+  point OpenClaw at the Codex CLI bridge profile.
 - Wrapper: run a command under a selected profile without permanently changing
   the active profile after the command exits.
 

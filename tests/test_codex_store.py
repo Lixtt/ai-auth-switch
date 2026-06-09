@@ -17,7 +17,12 @@ if str(ROOT) not in sys.path:
 
 from ai_auth_switch.providers.codex import CodexProvider
 from ai_auth_switch.store import AuthStore
-from ai_auth_switch.sync import OPENAI_CODEX_DEFAULT_PROFILE, sync_codex_dependents
+from ai_auth_switch.sync import (
+    OPENAI_CODEX_DEFAULT_PROFILE,
+    _hermes_snapshot_path,
+    _sync_current_hermes_state_back_to_snapshot,
+    sync_codex_dependents,
+)
 from ai_auth_switch.cli import main as cli_main
 
 
@@ -225,6 +230,151 @@ class CodexStoreTests(unittest.TestCase):
             self.assertIn("person@example.com", output)
 
 
+    def test_cli_auth_login_requests_independent_hermes_login(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            store_dir = root / "store"
+            codex_home.mkdir()
+            active_auth = codex_home / "auth.json"
+
+            def fake_login(provider, login_args):
+                self.assertEqual(provider.id, "codex")
+                self.assertEqual(login_args, [])
+                active_auth.write_text(
+                    json.dumps(
+                        {
+                            "auth_mode": "chatgpt",
+                            "tokens": {
+                                "access_token": fake_jwt(
+                                    {
+                                        "https://api.openai.com/profile": {
+                                            "email": "person@example.com"
+                                        }
+                                    }
+                                )
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return 0
+
+            sync_calls = []
+
+            def fake_sync(provider, **kwargs):
+                sync_calls.append((provider.id, kwargs))
+                return []
+
+            out = io.StringIO()
+            with mock.patch("ai_auth_switch.cli._run_login", fake_login):
+                with mock.patch("ai_auth_switch.cli.sync_codex_dependents", fake_sync):
+                    with contextlib.redirect_stdout(out):
+                        status = cli_main(
+                            [
+                                "--store-dir",
+                                str(store_dir),
+                                "--codex-home",
+                                str(codex_home),
+                                "auth",
+                                "login",
+                                "codex",
+                            ]
+                        )
+
+            self.assertEqual(status, 0)
+            self.assertEqual(len(sync_calls), 1)
+            provider_id, kwargs = sync_calls[0]
+            self.assertEqual(provider_id, "codex")
+            self.assertTrue(kwargs["hermes_login"])
+            self.assertEqual(kwargs["hermes_profile_name"], "person@example.com")
+            self.assertEqual(kwargs["store_dir"], store_dir)
+            self.assertIn("saved codex login as person@example.com", out.getvalue())
+
+
+    def test_sync_current_hermes_state_updates_matching_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store_dir = root / "store"
+            hermes_home = root / ".hermes"
+            hermes_home.mkdir()
+
+            old_access = fake_jwt(
+                {
+                    "exp": 4102444700,
+                    "https://api.openai.com/profile": {"email": "person@example.com"},
+                }
+            )
+            new_access = fake_jwt(
+                {
+                    "exp": 4102444800,
+                    "https://api.openai.com/profile": {"email": "person@example.com"},
+                }
+            )
+            old_state = {
+                "tokens": {"access_token": old_access, "refresh_token": "rt_old"},
+                "last_refresh": "2026-01-01T00:00:00Z",
+                "label": "person@example.com",
+            }
+            new_state = {
+                "tokens": {"access_token": new_access, "refresh_token": "rt_new"},
+                "last_refresh": "2026-01-02T00:00:00Z",
+                "label": "person@example.com",
+            }
+            snapshot_path = _hermes_snapshot_path("person@example.com", store_dir)
+            snapshot_path.parent.mkdir(parents=True)
+            snapshot_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "provider": "openai-codex",
+                        "profile": "person@example.com",
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                        "provider_state": old_state,
+                        "credential_pool": [
+                            {
+                                "source": "device_code",
+                                "auth_type": "oauth",
+                                "access_token": old_access,
+                                "refresh_token": "rt_old",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (hermes_home / "auth.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "active_provider": "openai-codex",
+                        "providers": {"openai-codex": new_state},
+                        "credential_pool": {
+                            "openai-codex": [
+                                {
+                                    "source": "device_code",
+                                    "auth_type": "oauth",
+                                    "access_token": new_access,
+                                    "refresh_token": "rt_new",
+                                }
+                            ]
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+                _sync_current_hermes_state_back_to_snapshot(store_dir=store_dir)
+
+            snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                snapshot["provider_state"]["tokens"]["refresh_token"],
+                "rt_new",
+            )
+            self.assertEqual(snapshot["credential_pool"][0]["refresh_token"], "rt_new")
+
+
     def test_sync_codex_dependents_updates_openclaw_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -316,7 +466,13 @@ class CodexStoreTests(unittest.TestCase):
             )
 
             out = io.StringIO()
-            with mock.patch.dict(os.environ, {"OPENCLAW_STATE_DIR": str(openclaw)}):
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "OPENCLAW_STATE_DIR": str(openclaw),
+                    "HERMES_AGENT_DIR": str(root / "missing-hermes"),
+                },
+            ):
                 with contextlib.redirect_stdout(out):
                     status = cli_main(
                         [
@@ -330,8 +486,8 @@ class CodexStoreTests(unittest.TestCase):
                     )
 
             self.assertEqual(status, 0)
+            self.assertIn("hermes: skipped: Hermes install path not found", out.getvalue())
             self.assertIn("openclaw: synced", out.getvalue())
-            self.assertNotIn("hermes:", out.getvalue())
             state = json.loads((agent / "auth-state.json").read_text(encoding="utf-8"))
             self.assertEqual(state["lastGood"]["openai-codex"], OPENAI_CODEX_DEFAULT_PROFILE)
 

@@ -73,11 +73,23 @@ def _print_sync_results(results: Sequence[SyncResult]) -> None:
         )
 
 
-def _sync_after_auth_change(args: argparse.Namespace, provider: Provider) -> list[SyncResult]:
+def _sync_after_auth_change(
+    args: argparse.Namespace,
+    provider: Provider,
+    store: AuthStore,
+    *,
+    profile_name: str | None = None,
+    hermes_login: bool = False,
+) -> list[SyncResult]:
     if provider.id != "codex" or getattr(args, "no_dependent_sync", False):
         return []
     try:
-        results = sync_codex_dependents(provider)
+        results = sync_codex_dependents(
+            provider,
+            hermes_login=hermes_login,
+            hermes_profile_name=profile_name,
+            store_dir=store.base_dir,
+        )
     except AiAuthSwitchError as exc:
         results = [SyncResult(target="dependent-sync", status="error", message=str(exc))]
     _print_sync_results(results)
@@ -134,7 +146,7 @@ def _cmd_auth_save(args: argparse.Namespace) -> int:
         profile = store.save_current(provider, args.name)
     print(f"saved {provider.id} auth as {profile.name}")
     print(f"active {provider.id} auth -> {profile.path}")
-    _sync_after_auth_change(args, provider)
+    _sync_after_auth_change(args, provider, store, profile_name=profile.name)
     return 0
 
 
@@ -144,17 +156,23 @@ def _cmd_auth_use(args: argparse.Namespace) -> int:
     with store.lock():
         profile = store.activate(provider, args.name)
     print(f"active {provider.id} auth -> {profile.name}")
-    _sync_after_auth_change(args, provider)
+    _sync_after_auth_change(args, provider, store, profile_name=profile.name)
     return 0
 
 
 def _cmd_auth_sync(args: argparse.Namespace) -> int:
     provider = _provider_from_args(args)
+    store = _store_from_args(args)
+    with store.lock():
+        current = store.current_profile(provider)
     results = sync_codex_dependents(
         provider,
-        sync_hermes=args.hermes,
+        sync_hermes=not args.no_hermes,
         sync_openclaw=not args.no_openclaw,
         restart_openclaw=not args.no_openclaw_restart,
+        hermes_login=args.hermes_login,
+        hermes_profile_name=current.name if current else None,
+        store_dir=store.base_dir,
     )
     _print_sync_results(results)
     return 1 if any(not result.ok for result in results) else 0
@@ -219,7 +237,13 @@ def _cmd_auth_login(args: argparse.Namespace) -> int:
 
     print(f"saved {provider.id} login as {profile.name}")
     print(f"active {provider.id} auth -> {profile.path}")
-    _sync_after_auth_change(args, provider)
+    _sync_after_auth_change(
+        args,
+        provider,
+        store,
+        profile_name=profile.name,
+        hermes_login=provider.id == "codex",
+    )
     return 0
 
 
@@ -242,15 +266,18 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if not command:
         command = list(provider.login_command)
 
+    def sync_selected() -> None:
+        _sync_after_auth_change(args, provider, store, profile_name=args.name)
+
     def sync_current() -> None:
-        _sync_after_auth_change(args, provider)
+        _sync_after_auth_change(args, provider, store)
 
     return run_with_profile(
         store,
         provider,
         args.name,
         command,
-        on_activated=sync_current,
+        on_activated=sync_selected,
         on_restored=sync_current,
     )
 
@@ -304,13 +331,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     auth_sync.add_argument("provider", choices=SUPPORTED_PROVIDERS)
     auth_sync.add_argument(
-        "--hermes",
+        "--no-hermes",
         action="store_true",
-        help=(
-            "Also import Codex CLI tokens into Hermes. This can conflict with "
-            "refresh-token rotation and requires "
-            "AI_AUTH_SWITCH_UNSAFE_IMPORT_HERMES_CODEX_TOKENS=1."
-        ),
+        help="Skip Hermes independent Codex session activation.",
+    )
+    auth_sync.add_argument(
+        "--hermes-login",
+        action="store_true",
+        help="Run Hermes's own Codex device-code login for the active Codex profile.",
     )
     auth_sync.add_argument(
         "--no-openclaw",

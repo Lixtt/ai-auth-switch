@@ -12,11 +12,12 @@ from typing import Any
 
 from ai_auth_switch.errors import AiAuthSwitchError
 from ai_auth_switch.providers import Provider
-from ai_auth_switch.store import set_private_permissions
+from ai_auth_switch.store import sanitize_profile_name, set_private_permissions
 
 
 OPENAI_CODEX_PROVIDER = "openai-codex"
 OPENAI_CODEX_DEFAULT_PROFILE = "openai-codex:default"
+HERMES_CODEX_DEFAULT_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
 
 @dataclass(frozen=True)
@@ -108,9 +109,12 @@ def _summarize_codex_auth(auth_path: Path) -> dict[str, Any]:
 def sync_codex_dependents(
     provider: Provider,
     *,
-    sync_hermes: bool = False,
+    sync_hermes: bool = True,
     sync_openclaw: bool = True,
     restart_openclaw: bool = True,
+    hermes_login: bool = False,
+    hermes_profile_name: str | None = None,
+    store_dir: Path | None = None,
     hermes_agent_dir: Path | None = None,
     openclaw_state_dir: Path | None = None,
 ) -> list[SyncResult]:
@@ -124,7 +128,24 @@ def sync_codex_dependents(
 
     results: list[SyncResult] = []
     if sync_hermes:
-        results.append(_sync_hermes_from_codex(active, hermes_agent_dir=hermes_agent_dir))
+        profile_name = hermes_profile_name or provider.infer_profile_name(active)
+        if not profile_name:
+            results.append(
+                SyncResult(
+                    target="hermes",
+                    status="skipped",
+                    message="could not infer Codex profile name for Hermes sync",
+                )
+            )
+        else:
+            results.append(
+                _sync_hermes_profile(
+                    profile_name,
+                    login=hermes_login,
+                    store_dir=store_dir,
+                    hermes_agent_dir=hermes_agent_dir,
+                )
+            )
     if sync_openclaw:
         results.append(_sync_openclaw_from_codex(openclaw_state_dir=openclaw_state_dir))
         if restart_openclaw:
@@ -132,29 +153,45 @@ def sync_codex_dependents(
     return results
 
 
-def _sync_hermes_from_codex(
-    auth_path: Path,
+def _dependent_store_dir(store_dir: Path | None = None) -> Path:
+    if store_dir is not None:
+        return store_dir.expanduser()
+    configured = os.environ.get("AI_AUTH_SWITCH_HOME", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    xdg = os.environ.get("XDG_DATA_HOME", "").strip()
+    if xdg:
+        return Path(xdg).expanduser() / "ai-auth-switch"
+    return Path.home() / ".local" / "share" / "ai-auth-switch"
+
+
+def _hermes_snapshot_path(profile_name: str, store_dir: Path | None = None) -> Path:
+    return (
+        _dependent_store_dir(store_dir)
+        / "dependent-auth"
+        / "hermes"
+        / "codex"
+        / f"{sanitize_profile_name(profile_name)}.json"
+    )
+
+
+def _default_hermes_agent_dir(hermes_agent_dir: Path | None = None) -> Path:
+    if hermes_agent_dir is not None:
+        return hermes_agent_dir.expanduser()
+    configured_agent_dir = os.environ.get("HERMES_AGENT_DIR", "").strip()
+    if configured_agent_dir:
+        return Path(configured_agent_dir).expanduser()
+    return Path.home() / ".hermes" / "hermes-agent"
+
+
+def _sync_hermes_profile(
+    profile_name: str,
     *,
+    login: bool,
+    store_dir: Path | None = None,
     hermes_agent_dir: Path | None = None,
 ) -> SyncResult:
-    if os.environ.get("AI_AUTH_SWITCH_UNSAFE_IMPORT_HERMES_CODEX_TOKENS") != "1":
-        return SyncResult(
-            target="hermes",
-            status="skipped",
-            message=(
-                "Codex token import is disabled to avoid refresh-token reuse; "
-                "use Hermes's own Codex login instead"
-            ),
-        )
-
-    home = Path.home()
-    configured_agent_dir = os.environ.get("HERMES_AGENT_DIR", "").strip()
-    if hermes_agent_dir is not None:
-        agent_dir = hermes_agent_dir.expanduser()
-    elif configured_agent_dir:
-        agent_dir = Path(configured_agent_dir).expanduser()
-    else:
-        agent_dir = home / ".hermes" / "hermes-agent"
+    agent_dir = _default_hermes_agent_dir(hermes_agent_dir)
     python = agent_dir / "venv" / "bin" / "python"
     auth_module = agent_dir / "hermes_cli" / "auth.py"
     if not python.exists() or not os.access(python, os.X_OK) or not auth_module.exists():
@@ -165,9 +202,39 @@ def _sync_hermes_from_codex(
             path=agent_dir,
         )
 
+    snapshot = _hermes_snapshot_path(profile_name, store_dir)
+    _sync_current_hermes_state_back_to_snapshot(store_dir=store_dir)
+
+    if login:
+        return _login_hermes_codex_profile(
+            profile_name,
+            snapshot,
+            python=python,
+            agent_dir=agent_dir,
+        )
+
+    if not snapshot.exists():
+        return SyncResult(
+            target="hermes",
+            status="skipped",
+            message=(
+                f"no Hermes Codex session saved for {profile_name}; "
+                f"run `ai-auth-switch auth login codex {profile_name}` to create one"
+            ),
+            path=snapshot,
+        )
+
+    return _activate_hermes_codex_snapshot(snapshot, python=python, agent_dir=agent_dir)
+
+
+def _login_hermes_codex_profile(
+    profile_name: str,
+    snapshot: Path,
+    *,
+    python: Path,
+    agent_dir: Path,
+) -> SyncResult:
     helper = r"""
-import base64
-import datetime as dt
 import json
 import os
 import sys
@@ -178,53 +245,196 @@ sys.path.insert(0, str(agent_dir))
 
 from hermes_cli.auth import (  # noqa: E402
     DEFAULT_CODEX_BASE_URL,
-    _import_codex_cli_tokens,
+    _codex_device_code_login,
+    _load_auth_store,
+    _load_provider_state,
     _save_codex_tokens,
     _update_config_for_provider,
+    unsuppress_credential_source,
 )
+from agent.credential_pool import load_pool  # noqa: E402
 
 
-def decode_jwt(token: str) -> dict:
-    parts = token.split(".")
-    if len(parts) < 2:
-        return {}
-    payload = parts[1] + "=" * (-len(parts[1]) % 4)
-    try:
-        return json.loads(base64.urlsafe_b64decode(payload))
-    except Exception:
-        return {}
+profile_name = os.environ["AI_AUTH_SWITCH_HERMES_PROFILE_NAME"]
+snapshot_path = Path(os.environ["AI_AUTH_SWITCH_HERMES_SNAPSHOT_PATH"]).expanduser()
 
-
-tokens = _import_codex_cli_tokens()
-if not tokens:
-    print(json.dumps({"status": "skipped", "reason": "no_valid_codex_cli_tokens"}))
-    raise SystemExit(0)
-
-source = Path(os.environ["CODEX_HOME"]).expanduser() / "auth.json"
-source_payload = json.loads(source.read_text(encoding="utf-8"))
-last_refresh = source_payload.get("last_refresh")
-if not isinstance(last_refresh, str):
-    last_refresh = None
-
-_save_codex_tokens(tokens, last_refresh)
-base_url = os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/") or DEFAULT_CODEX_BASE_URL
+print(f"Signing in to Hermes OpenAI Codex for profile {profile_name}...")
+creds = _codex_device_code_login()
+base_url = creds.get("base_url", DEFAULT_CODEX_BASE_URL)
+try:
+    unsuppress_credential_source("openai-codex", "device_code")
+except Exception:
+    pass
+_save_codex_tokens(creds["tokens"], creds.get("last_refresh"), label=profile_name)
 config_path = _update_config_for_provider("openai-codex", base_url)
+try:
+    load_pool("openai-codex")
+except Exception:
+    pass
+auth_store = _load_auth_store()
+state = _load_provider_state(auth_store, "openai-codex") or {}
+pool = auth_store.get("credential_pool")
+pool_entries = []
+if isinstance(pool, dict) and isinstance(pool.get("openai-codex"), list):
+    pool_entries = [item for item in pool["openai-codex"] if isinstance(item, dict)]
 
-id_payload = decode_jwt(tokens.get("id_token") or "")
-access_payload = decode_jwt(tokens.get("access_token") or "")
-access_exp = access_payload.get("exp")
+snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+os.chmod(snapshot_path.parent, 0o700)
+tmp = snapshot_path.with_name(f".{snapshot_path.name}.tmp.{os.getpid()}")
+tmp.write_text(json.dumps({
+    "version": 1,
+    "provider": "openai-codex",
+    "profile": profile_name,
+    "base_url": base_url,
+    "provider_state": state,
+    "credential_pool": pool_entries,
+}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+os.chmod(tmp, 0o600)
+os.replace(tmp, snapshot_path)
+os.chmod(snapshot_path, 0o600)
+
 print(json.dumps({
     "status": "synced",
-    "email": id_payload.get("email"),
-    "account_id": tokens.get("account_id"),
-    "access_exp": dt.datetime.fromtimestamp(access_exp, dt.timezone.utc).isoformat() if access_exp else None,
     "config": str(config_path),
+    "snapshot": str(snapshot_path),
 }, ensure_ascii=False))
 """
 
     env = os.environ.copy()
     env["AI_AUTH_SWITCH_HERMES_AGENT_DIR"] = str(agent_dir)
-    env["CODEX_HOME"] = str(auth_path.parent)
+    env["AI_AUTH_SWITCH_HERMES_PROFILE_NAME"] = profile_name
+    env["AI_AUTH_SWITCH_HERMES_SNAPSHOT_PATH"] = str(snapshot)
+    try:
+        completed = subprocess.run(
+            [str(python), "-c", helper],
+            check=False,
+            env=env,
+            timeout=15 * 60,
+        )
+    except subprocess.TimeoutExpired:
+        return SyncResult(
+            target="hermes",
+            status="error",
+            message="Hermes Codex login timed out",
+            path=agent_dir,
+        )
+    except OSError as exc:
+        return SyncResult(
+            target="hermes",
+            status="error",
+            message=f"failed to run Hermes Codex login: {exc}",
+            path=agent_dir,
+        )
+
+    if completed.returncode != 0:
+        return SyncResult(
+            target="hermes",
+            status="error",
+            message=f"Hermes Codex login exited {completed.returncode}",
+            path=agent_dir,
+        )
+
+    return SyncResult(
+        target="hermes",
+        status="synced",
+        message=f"independent Codex session saved for {profile_name}",
+        path=snapshot,
+    )
+
+
+def _activate_hermes_codex_snapshot(
+    snapshot: Path,
+    *,
+    python: Path,
+    agent_dir: Path,
+) -> SyncResult:
+    helper = r"""
+import json
+import os
+import sys
+from pathlib import Path
+
+agent_dir = Path(os.environ["AI_AUTH_SWITCH_HERMES_AGENT_DIR"])
+sys.path.insert(0, str(agent_dir))
+
+from hermes_cli.auth import (  # noqa: E402
+    DEFAULT_CODEX_BASE_URL,
+    _auth_store_lock,
+    _load_auth_store,
+    _save_auth_store,
+    _save_provider_state,
+    _update_config_for_provider,
+)
+from agent.credential_pool import load_pool  # noqa: E402
+
+
+def _pool_entries_from_state(state, base_url):
+    tokens = state.get("tokens") if isinstance(state, dict) else None
+    if not isinstance(tokens, dict) or not tokens.get("access_token"):
+        return []
+    entry = {
+        "source": "device_code",
+        "auth_type": "oauth",
+        "access_token": tokens.get("access_token", ""),
+        "refresh_token": tokens.get("refresh_token"),
+        "base_url": base_url,
+        "last_refresh": state.get("last_refresh"),
+        "label": state.get("label") or "device_code",
+    }
+    return [{key: value for key, value in entry.items() if value is not None}]
+
+
+def _unsuppress_device_code(auth_store):
+    suppressed = auth_store.get("suppressed_sources")
+    if not isinstance(suppressed, dict):
+        return
+    provider_list = suppressed.get("openai-codex")
+    if not isinstance(provider_list, list):
+        return
+    while "device_code" in provider_list:
+        provider_list.remove("device_code")
+    if not provider_list:
+        suppressed.pop("openai-codex", None)
+    if not suppressed:
+        auth_store.pop("suppressed_sources", None)
+
+snapshot_path = Path(os.environ["AI_AUTH_SWITCH_HERMES_SNAPSHOT_PATH"]).expanduser()
+snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+state = snapshot.get("provider_state")
+if not isinstance(state, dict):
+    raise SystemExit("invalid Hermes snapshot: missing provider_state")
+pool_entries = snapshot.get("credential_pool")
+if pool_entries is not None and not isinstance(pool_entries, list):
+    raise SystemExit("invalid Hermes snapshot: credential_pool must be a list")
+
+base_url = str(snapshot.get("base_url") or DEFAULT_CODEX_BASE_URL).strip().rstrip("/")
+active_pool = [
+    item for item in (pool_entries or _pool_entries_from_state(state, base_url))
+    if isinstance(item, dict)
+]
+with _auth_store_lock():
+    auth_store = _load_auth_store()
+    _save_provider_state(auth_store, "openai-codex", state)
+    pool = auth_store.get("credential_pool")
+    if not isinstance(pool, dict):
+        pool = {}
+        auth_store["credential_pool"] = pool
+    pool["openai-codex"] = active_pool
+    _unsuppress_device_code(auth_store)
+    auth_store["active_provider"] = "openai-codex"
+    _save_auth_store(auth_store)
+
+try:
+    load_pool("openai-codex")
+except Exception:
+    pass
+config_path = _update_config_for_provider("openai-codex", base_url)
+print(json.dumps({"status": "synced", "config": str(config_path)}, ensure_ascii=False))
+"""
+
+    env = os.environ.copy()
+    env["AI_AUTH_SWITCH_HERMES_AGENT_DIR"] = str(agent_dir)
+    env["AI_AUTH_SWITCH_HERMES_SNAPSHOT_PATH"] = str(snapshot)
     try:
         completed = subprocess.run(
             [str(python), "-c", helper],
@@ -238,14 +448,14 @@ print(json.dumps({
         return SyncResult(
             target="hermes",
             status="error",
-            message="Hermes sync timed out",
+            message="Hermes Codex activation timed out",
             path=agent_dir,
         )
     except OSError as exc:
         return SyncResult(
             target="hermes",
             status="error",
-            message=f"failed to run Hermes sync: {exc}",
+            message=f"failed to run Hermes Codex activation: {exc}",
             path=agent_dir,
         )
 
@@ -256,7 +466,7 @@ print(json.dumps({
         return SyncResult(
             target="hermes",
             status="error",
-            message=f"Hermes sync exited {completed.returncode}",
+            message=f"Hermes Codex activation exited {completed.returncode}",
             path=agent_dir,
         )
 
@@ -267,23 +477,141 @@ print(json.dumps({
         return SyncResult(
             target="hermes",
             status="synced",
-            message=f"openai-codex credentials imported{suffix}",
+            message=f"activated independent Codex session{suffix}",
             path=Path(config).expanduser() if isinstance(config, str) and config else None,
-        )
-    if payload and payload.get("status") == "skipped":
-        reason = payload.get("reason")
-        return SyncResult(
-            target="hermes",
-            status="skipped",
-            message=str(reason or "Hermes skipped"),
-            path=agent_dir,
         )
     return SyncResult(
         target="hermes",
         status="synced",
-        message="openai-codex credentials imported",
+        message="activated independent Codex session",
         path=agent_dir,
     )
+
+
+def _sync_current_hermes_state_back_to_snapshot(*, store_dir: Path | None = None) -> None:
+    auth_path = Path(os.environ.get("HERMES_HOME", "")).expanduser() / "auth.json"
+    if not os.environ.get("HERMES_HOME", "").strip():
+        auth_path = Path.home() / ".hermes" / "auth.json"
+    if not auth_path.exists():
+        return
+
+    try:
+        auth_store = _read_json(auth_path)
+    except AiAuthSwitchError:
+        return
+    provider_state = (auth_store.get("providers") or {}).get("openai-codex")
+    if not isinstance(provider_state, dict):
+        return
+    pool_entries = _hermes_codex_pool_entries(auth_store)
+    identity = _codex_provider_state_identity(provider_state) or _codex_pool_entries_identity(
+        pool_entries
+    )
+    if not identity:
+        return
+
+    root = _dependent_store_dir(store_dir) / "dependent-auth" / "hermes" / "codex"
+    if not root.exists():
+        return
+    for snapshot in sorted(root.glob("*.json")):
+        try:
+            data = _read_json(snapshot)
+        except AiAuthSwitchError:
+            continue
+        existing_state = data.get("provider_state")
+        if not isinstance(existing_state, dict):
+            continue
+        existing_pool = data.get("credential_pool")
+        if not isinstance(existing_pool, list):
+            existing_pool = []
+        existing_identity = _codex_provider_state_identity(
+            existing_state
+        ) or _codex_pool_entries_identity(existing_pool)
+        if existing_identity != identity:
+            continue
+        data["provider_state"] = provider_state
+        data["credential_pool"] = pool_entries
+        _write_json(snapshot, data)
+        return
+
+
+def _hermes_codex_pool_entries(auth_store: dict[str, Any]) -> list[dict[str, Any]]:
+    pool = auth_store.get("credential_pool")
+    if isinstance(pool, dict):
+        entries = pool.get("openai-codex")
+        if isinstance(entries, list):
+            return [dict(item) for item in entries if isinstance(item, dict)]
+    provider_state = (auth_store.get("providers") or {}).get("openai-codex")
+    if isinstance(provider_state, dict):
+        generated = _hermes_codex_pool_entries_from_provider_state(provider_state)
+        if generated:
+            return generated
+    return []
+
+
+def _hermes_codex_pool_entries_from_provider_state(
+    provider_state: dict[str, Any],
+) -> list[dict[str, Any]]:
+    tokens = provider_state.get("tokens")
+    if not isinstance(tokens, dict) or not tokens.get("access_token"):
+        return []
+    entry = {
+        "source": "device_code",
+        "auth_type": "oauth",
+        "access_token": tokens.get("access_token"),
+        "refresh_token": tokens.get("refresh_token"),
+        "base_url": HERMES_CODEX_DEFAULT_BASE_URL,
+        "last_refresh": provider_state.get("last_refresh"),
+        "label": provider_state.get("label") or "device_code",
+    }
+    return [{key: value for key, value in entry.items() if value is not None}]
+
+
+def _codex_pool_entries_identity(entries: list[Any]) -> str | None:
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        identity = _codex_provider_state_identity(entry)
+        if identity:
+            return identity
+    return None
+
+
+def _codex_provider_state_identity(provider_state: dict[str, Any]) -> str | None:
+    tokens = provider_state.get("tokens")
+    if not isinstance(tokens, dict):
+        tokens = {
+            key: value
+            for key, value in {
+                "id_token": provider_state.get("id_token"),
+                "access_token": provider_state.get("access_token"),
+                "refresh_token": provider_state.get("refresh_token"),
+                "account_id": provider_state.get("account_id"),
+            }.items()
+            if value is not None
+        }
+
+    id_payload = _decode_jwt_payload(str(tokens.get("id_token") or ""))
+    access_payload = _decode_jwt_payload(str(tokens.get("access_token") or ""))
+    profile = access_payload.get("https://api.openai.com/profile")
+    if not isinstance(profile, dict):
+        profile = {}
+    auth_claims = access_payload.get("https://api.openai.com/auth")
+    if not isinstance(auth_claims, dict):
+        auth_claims = {}
+
+    email = id_payload.get("email") or profile.get("email")
+    if isinstance(email, str) and email.strip():
+        return f"email:{email.strip().lower()}"
+
+    account_id = (
+        tokens.get("account_id")
+        or auth_claims.get("chatgpt_account_id")
+        or auth_claims.get("account_id")
+        or access_payload.get("account_id")
+    )
+    if isinstance(account_id, str) and account_id.strip():
+        return f"account:{account_id.strip()}"
+    return None
 
 
 def _sync_openclaw_from_codex(
