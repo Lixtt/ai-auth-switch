@@ -242,7 +242,6 @@ def _cmd_auth_login(args: argparse.Namespace) -> int:
         provider,
         store,
         profile_name=profile.name,
-        hermes_login=provider.id == "codex",
     )
     return 0
 
@@ -333,12 +332,12 @@ def build_parser() -> argparse.ArgumentParser:
     auth_sync.add_argument(
         "--no-hermes",
         action="store_true",
-        help="Skip Hermes independent Codex session activation.",
+        help="Skip Hermes Codex CLI bridge sync.",
     )
     auth_sync.add_argument(
         "--hermes-login",
         action="store_true",
-        help="Run Hermes's own Codex device-code login for the active Codex profile.",
+        help="Deprecated compatibility option; Hermes now uses Codex CLI auth via bridge sync.",
     )
     auth_sync.add_argument(
         "--no-openclaw",

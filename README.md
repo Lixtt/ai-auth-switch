@@ -61,8 +61,8 @@ ai-auth-switch auth current codex
 After Codex auth is saved, logged in, or switched, `ai-auth-switch` also syncs
 Codex-dependent local tools:
 
-- Hermes is switched to the independent Hermes Codex session saved for the
-  active Codex profile.
+- Hermes is pointed at `openai-codex` and switched to Hermes's Codex CLI app
+  server runtime, so it follows the active Codex CLI account.
 - OpenClaw is pointed at its Codex CLI default profile.
 
 You can run that step explicitly too:
@@ -71,24 +71,19 @@ You can run that step explicitly too:
 ai-auth-switch auth sync codex
 ```
 
-`ai-auth-switch auth login codex` also runs Hermes's own Codex device-code
-login for the same profile. That creates a separate Hermes OAuth session under:
+Hermes does not import or share the Codex CLI refresh token. The sync clears
+Hermes's old independent `openai-codex` OAuth state and installs a local bridge
+entry that uses Hermes's `codex_app_server` runtime. OpenClaw is updated to use
+the Codex CLI bridge profile `openai-codex:default`.
 
-```text
-~/.local/share/ai-auth-switch/dependent-auth/hermes/codex/<profile>.json
-```
-
-Hermes does not import or share the Codex CLI refresh token. Codex, Hermes, and
-OpenClaw can refresh their own auth state without rotating the same refresh
-token out from under another tool.
-
-If a Codex profile was created before Hermes sync existed, add the Hermes
-session once:
+The old Hermes login flag is kept only for command compatibility and is now a
+no-op:
 
 ```bash
-ai-auth-switch auth use codex <profile>
 ai-auth-switch auth sync codex --hermes-login
 ```
+
+Use `ai-auth-switch auth sync codex` normally.
 
 If Codex reports that a refresh token was already used after switching
 profiles, that profile's stored refresh token has already been invalidated by
@@ -151,8 +146,7 @@ AI_AUTH_SWITCH_HOME=/secure/path ai-auth-switch auth list codex
 `ai-auth-switch` has three separate layers:
 
 - Auth management: save, list, activate, rename, remove, and inspect profiles.
-- Dependent sync: activate each profile's independent Hermes Codex session and
-  point OpenClaw at the Codex CLI bridge profile.
+- Dependent sync: point Hermes and OpenClaw at the active Codex CLI auth bridge.
 - Wrapper: run a command under a selected profile without permanently changing
   the active profile after the command exits.
 
