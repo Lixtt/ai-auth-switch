@@ -20,7 +20,7 @@ from ai_auth_switch.store import AuthStore
 from ai_auth_switch.sync import (
     OPENAI_CODEX_DEFAULT_PROFILE,
     HERMES_CODEX_BRIDGE_SOURCE,
-    HERMES_CODEX_BRIDGE_TOKEN,
+    HERMES_CODEX_CLI_ACCESS_SOURCE,
     sync_codex_dependents,
 )
 from ai_auth_switch.cli import main as cli_main
@@ -292,7 +292,7 @@ class CodexStoreTests(unittest.TestCase):
             self.assertIn("saved codex login as person@example.com", out.getvalue())
 
 
-    def test_sync_codex_dependents_updates_hermes_codex_cli_bridge(self) -> None:
+    def test_sync_codex_dependents_updates_hermes_codex_cli_access_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             codex_home = root / ".codex"
@@ -329,15 +329,24 @@ class CodexStoreTests(unittest.TestCase):
             def fake_run(command, **kwargs):
                 calls.append((command, kwargs))
                 helper = command[2]
-                self.assertIn("codex_app_server", helper)
+                self.assertNotIn("codex_app_server", helper)
+                self.assertIn('set_runtime(config, "auto")', helper)
+                self.assertIn("access_token", helper)
                 self.assertNotIn("_codex_device_code_login", helper)
                 env = kwargs["env"]
                 self.assertEqual(env["AI_AUTH_SWITCH_HERMES_PROFILE_NAME"], "person@example.com")
-                self.assertEqual(env["AI_AUTH_SWITCH_HERMES_BRIDGE_SOURCE"], HERMES_CODEX_BRIDGE_SOURCE)
-                self.assertEqual(env["AI_AUTH_SWITCH_HERMES_BRIDGE_TOKEN"], HERMES_CODEX_BRIDGE_TOKEN)
+                self.assertEqual(env["AI_AUTH_SWITCH_CODEX_AUTH_PATH"], str(codex_home / "auth.json"))
+                self.assertEqual(
+                    env["AI_AUTH_SWITCH_HERMES_CLI_ACCESS_SOURCE"],
+                    HERMES_CODEX_CLI_ACCESS_SOURCE,
+                )
+                self.assertEqual(
+                    env["AI_AUTH_SWITCH_HERMES_LEGACY_BRIDGE_SOURCE"],
+                    HERMES_CODEX_BRIDGE_SOURCE,
+                )
                 return mock.Mock(
                     returncode=0,
-                    stdout='{"status":"synced","config":"/tmp/hermes/config.yaml"}\n',
+                    stdout='{"status":"synced","config":"/tmp/hermes/config.yaml","runtime":"auto"}\n',
                     stderr="",
                 )
 
@@ -354,9 +363,10 @@ class CodexStoreTests(unittest.TestCase):
             self.assertEqual([result.target for result in results], ["hermes"])
             self.assertTrue(results[0].ok)
             self.assertIn(
-                "Codex CLI bridge active for person@example.com",
+                "Codex CLI access token active for person@example.com",
                 results[0].message,
             )
+            self.assertIn("runtime auto", results[0].message)
 
 
     def test_sync_codex_dependents_updates_openclaw_state(self) -> None:

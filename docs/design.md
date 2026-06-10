@@ -43,7 +43,8 @@ is saved, logged in, switched, or temporarily activated, `ai-auth-switch`
 syncs those dependent tool states:
 
 - Hermes is pointed at `openai-codex` and switched to Hermes's
-  `codex_app_server` runtime, which consumes the active Codex CLI auth.
+  `openai_runtime=auto` path with a credential-pool entry seeded from the
+  active Codex CLI access token.
 - OpenClaw is pointed at `openai-codex:default`, which is the Codex CLI auth
   bridge profile.
 - If `openclaw-gateway.service` is active, it is restarted so the new auth is
@@ -53,9 +54,9 @@ OpenAI Codex refresh tokens are single-use/rotating credentials. Sharing one
 refresh token between Codex CLI and Hermes can trigger refresh-token-reuse
 errors. For that reason, Hermes sync does not copy Codex CLI OAuth tokens into
 Hermes and no longer runs Hermes's own Codex login flow. Instead it removes the
-old Hermes-owned `openai-codex` OAuth state, installs a placeholder bridge pool
-entry, sets Hermes's active provider to `openai-codex`, and enables the
-`codex_app_server` runtime.
+old Hermes-owned `openai-codex` OAuth state, installs only the current Codex CLI
+access token as a pool entry, sets Hermes's active provider to `openai-codex`,
+and keeps `openai_runtime=auto` so Hermes handles the turn itself.
 
 The same operation can be run explicitly:
 

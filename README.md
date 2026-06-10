@@ -61,8 +61,9 @@ ai-auth-switch auth current codex
 After Codex auth is saved, logged in, or switched, `ai-auth-switch` also syncs
 Codex-dependent local tools:
 
-- Hermes is pointed at `openai-codex` and switched to Hermes's Codex CLI app
-  server runtime, so it follows the active Codex CLI account.
+- Hermes is pointed at `openai-codex` and seeded with a Codex CLI access-token
+  pool entry, so it follows the active Codex CLI account without handing turns
+  to `codex app-server`.
 - OpenClaw is pointed at its Codex CLI default profile.
 
 You can run that step explicitly too:
@@ -72,9 +73,10 @@ ai-auth-switch auth sync codex
 ```
 
 Hermes does not import or share the Codex CLI refresh token. The sync clears
-Hermes's old independent `openai-codex` OAuth state and installs a local bridge
-entry that uses Hermes's `codex_app_server` runtime. OpenClaw is updated to use
-the Codex CLI bridge profile `openai-codex:default`.
+Hermes's old independent `openai-codex` OAuth state, installs the current Codex
+CLI access token into Hermes's `openai-codex` credential pool, and leaves
+Hermes's `openai_runtime` on `auto`. OpenClaw is updated to use the Codex CLI
+bridge profile `openai-codex:default`.
 
 The old Hermes login flag is kept only for command compatibility and is now a
 no-op:

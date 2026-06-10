@@ -18,7 +18,8 @@ from ai_auth_switch.store import set_private_permissions
 OPENAI_CODEX_PROVIDER = "openai-codex"
 OPENAI_CODEX_DEFAULT_PROFILE = "openai-codex:default"
 HERMES_CODEX_BRIDGE_SOURCE = "manual:codex-cli-bridge"
-HERMES_CODEX_BRIDGE_TOKEN = "codex-app-server-uses-codex-cli-auth"
+HERMES_CODEX_CLI_ACCESS_SOURCE = "manual:codex-cli-access-token"
+HERMES_CODEX_DEFAULT_MODEL = "gpt-5.5"
 
 
 @dataclass(frozen=True)
@@ -143,6 +144,7 @@ def sync_codex_dependents(
             results.append(
                 _sync_hermes_profile(
                     profile_name,
+                    active_auth_path=active,
                     store_dir=store_dir,
                     hermes_agent_dir=hermes_agent_dir,
                 )
@@ -166,6 +168,7 @@ def _default_hermes_agent_dir(hermes_agent_dir: Path | None = None) -> Path:
 def _sync_hermes_profile(
     profile_name: str,
     *,
+    active_auth_path: Path,
     store_dir: Path | None = None,
     hermes_agent_dir: Path | None = None,
 ) -> SyncResult:
@@ -181,12 +184,18 @@ def _sync_hermes_profile(
             path=agent_dir,
         )
 
-    return _sync_hermes_codex_cli_bridge(profile_name, python=python, agent_dir=agent_dir)
+    return _sync_hermes_codex_cli_access_token(
+        profile_name,
+        active_auth_path=active_auth_path,
+        python=python,
+        agent_dir=agent_dir,
+    )
 
 
-def _sync_hermes_codex_cli_bridge(
+def _sync_hermes_codex_cli_access_token(
     profile_name: str,
     *,
+    active_auth_path: Path,
     python: Path,
     agent_dir: Path,
 ) -> SyncResult:
@@ -206,15 +215,45 @@ from hermes_cli.auth import (  # noqa: E402
     _save_auth_store,
     _update_config_for_provider,
 )
-from hermes_cli.codex_runtime_switch import apply as apply_codex_runtime  # noqa: E402
+from hermes_cli.codex_runtime_switch import set_runtime  # noqa: E402
 from hermes_cli.config import load_config, save_config  # noqa: E402
 from agent.credential_pool import load_pool  # noqa: E402
 
 
 profile_name = os.environ["AI_AUTH_SWITCH_HERMES_PROFILE_NAME"]
-bridge_source = os.environ["AI_AUTH_SWITCH_HERMES_BRIDGE_SOURCE"]
-bridge_token = os.environ["AI_AUTH_SWITCH_HERMES_BRIDGE_TOKEN"]
+active_auth_path = Path(os.environ["AI_AUTH_SWITCH_CODEX_AUTH_PATH"])
+cli_access_source = os.environ["AI_AUTH_SWITCH_HERMES_CLI_ACCESS_SOURCE"]
+legacy_bridge_source = os.environ["AI_AUTH_SWITCH_HERMES_LEGACY_BRIDGE_SOURCE"]
 base_url = DEFAULT_CODEX_BASE_URL
+
+try:
+    codex_auth = json.loads(active_auth_path.read_text(encoding="utf-8"))
+except Exception as exc:
+    raise SystemExit(f"failed to read Codex auth file {active_auth_path}: {exc}")
+tokens = codex_auth.get("tokens")
+if not isinstance(tokens, dict):
+    raise SystemExit(f"Codex auth file {active_auth_path} does not contain tokens")
+access_token = tokens.get("access_token")
+if not isinstance(access_token, str) or not access_token.strip():
+    raise SystemExit(f"Codex auth file {active_auth_path} is missing access_token")
+access_token = access_token.strip()
+
+def _decode_jwt_payload(token):
+    parts = token.split(".")
+    if len(parts) < 2:
+        return {}
+    payload = parts[1] + "=" * (-len(parts[1]) % 4)
+    try:
+        import base64
+        return json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
+    except Exception:
+        return {}
+
+access_payload = _decode_jwt_payload(access_token)
+expires_at_ms = None
+exp = access_payload.get("exp")
+if isinstance(exp, (int, float)):
+    expires_at_ms = int(exp * 1000)
 
 config_path = _update_config_for_provider("openai-codex", base_url)
 config = load_config()
@@ -224,9 +263,11 @@ if not isinstance(model_cfg, dict):
     config["model"] = model_cfg
 model_cfg["provider"] = "openai-codex"
 model_cfg["base_url"] = base_url
-runtime_status = apply_codex_runtime(config, "codex_app_server", persist_callback=save_config)
-if not runtime_status.success:
-    raise SystemExit(runtime_status.message or "failed to enable codex_app_server runtime")
+current_default = str(model_cfg.get("default") or "").strip()
+if not current_default.startswith("gpt-"):
+    model_cfg["default"] = os.environ["AI_AUTH_SWITCH_HERMES_DEFAULT_MODEL"]
+set_runtime(config, "auto")
+save_config(config)
 
 with _auth_store_lock():
     auth_store = _load_auth_store()
@@ -244,17 +285,35 @@ with _auth_store_lock():
             item
             for item in existing
             if isinstance(item, dict)
-            and item.get("source") not in {"device_code", "manual:device_code", bridge_source}
+            and item.get("source") not in {
+                "device_code",
+                "manual:device_code",
+                legacy_bridge_source,
+                cli_access_source,
+            }
         ]
-    retained.insert(0, {
-        "id": "codex-cli-bridge",
+    cli_entry = {
+        "id": "codex-cli-access-token",
         "label": f"Codex CLI ({profile_name})",
         "auth_type": "api_key",
         "priority": 0,
-        "source": bridge_source,
-        "access_token": bridge_token,
+        "source": cli_access_source,
+        "access_token": access_token,
         "base_url": base_url,
-    })
+        "last_status": None,
+        "last_status_at": None,
+        "last_error_code": None,
+        "last_error_reason": None,
+        "last_error_message": None,
+        "last_error_reset_at": None,
+        "request_count": 0,
+    }
+    last_refresh = codex_auth.get("last_refresh")
+    if isinstance(last_refresh, str) and last_refresh.strip():
+        cli_entry["last_refresh"] = last_refresh.strip()
+    if expires_at_ms is not None:
+        cli_entry["expires_at_ms"] = expires_at_ms
+    retained.insert(0, cli_entry)
     for index, item in enumerate(retained):
         if isinstance(item, dict):
             item["priority"] = index
@@ -274,16 +333,19 @@ except Exception:
 print(json.dumps({
     "status": "synced",
     "config": str(config_path),
-    "runtime": "codex_app_server",
+    "runtime": "auto",
     "profile": profile_name,
+    "expires_at_ms": expires_at_ms,
 }, ensure_ascii=False))
 """
 
     env = os.environ.copy()
     env["AI_AUTH_SWITCH_HERMES_AGENT_DIR"] = str(agent_dir)
     env["AI_AUTH_SWITCH_HERMES_PROFILE_NAME"] = profile_name
-    env["AI_AUTH_SWITCH_HERMES_BRIDGE_SOURCE"] = HERMES_CODEX_BRIDGE_SOURCE
-    env["AI_AUTH_SWITCH_HERMES_BRIDGE_TOKEN"] = HERMES_CODEX_BRIDGE_TOKEN
+    env["AI_AUTH_SWITCH_CODEX_AUTH_PATH"] = str(active_auth_path)
+    env["AI_AUTH_SWITCH_HERMES_CLI_ACCESS_SOURCE"] = HERMES_CODEX_CLI_ACCESS_SOURCE
+    env["AI_AUTH_SWITCH_HERMES_LEGACY_BRIDGE_SOURCE"] = HERMES_CODEX_BRIDGE_SOURCE
+    env["AI_AUTH_SWITCH_HERMES_DEFAULT_MODEL"] = HERMES_CODEX_DEFAULT_MODEL
     try:
         completed = subprocess.run(
             [str(python), "-c", helper],
@@ -297,14 +359,14 @@ print(json.dumps({
         return SyncResult(
             target="hermes",
             status="error",
-            message="Hermes Codex CLI bridge sync timed out",
+            message="Hermes Codex CLI access-token sync timed out",
             path=agent_dir,
         )
     except OSError as exc:
         return SyncResult(
             target="hermes",
             status="error",
-            message=f"failed to run Hermes Codex CLI bridge sync: {exc}",
+            message=f"failed to run Hermes Codex CLI access-token sync: {exc}",
             path=agent_dir,
         )
 
@@ -315,7 +377,7 @@ print(json.dumps({
         return SyncResult(
             target="hermes",
             status="error",
-            message=f"Hermes Codex CLI bridge sync exited {completed.returncode}: {_tail(output)}",
+            message=f"Hermes Codex CLI access-token sync exited {completed.returncode}: {_tail(output)}",
             path=agent_dir,
         )
 
@@ -326,13 +388,13 @@ print(json.dumps({
         return SyncResult(
             target="hermes",
             status="synced",
-            message=f"Codex CLI bridge active for {profile_name}; runtime codex_app_server{suffix}",
+            message=f"Codex CLI access token active for {profile_name}; runtime auto{suffix}",
             path=Path(config).expanduser() if isinstance(config, str) and config else None,
         )
     return SyncResult(
         target="hermes",
         status="synced",
-        message=f"Codex CLI bridge active for {profile_name}",
+        message=f"Codex CLI access token active for {profile_name}",
         path=agent_dir,
     )
 
