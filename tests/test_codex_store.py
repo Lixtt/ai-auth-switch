@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -19,6 +20,7 @@ from ai_auth_switch.providers.codex import CodexProvider
 from ai_auth_switch.store import AuthStore
 from ai_auth_switch.sync import (
     OPENAI_CODEX_DEFAULT_PROFILE,
+    OPENAI_DEFAULT_PROFILE,
     HERMES_CODEX_BRIDGE_SOURCE,
     HERMES_CODEX_CLI_ACCESS_SOURCE,
     sync_codex_dependents,
@@ -356,6 +358,7 @@ class CodexStoreTests(unittest.TestCase):
                     provider,
                     sync_openclaw=False,
                     hermes_login=True,
+                    restart_hermes=False,
                     hermes_agent_dir=hermes_agent,
                 )
 
@@ -368,6 +371,89 @@ class CodexStoreTests(unittest.TestCase):
             )
             self.assertIn("runtime auto", results[0].message)
 
+    def test_sync_codex_dependents_restarts_active_hermes_gateway(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            (codex_home / "auth.json").write_text(
+                json.dumps(
+                    {
+                        "auth_mode": "chatgpt",
+                        "tokens": {
+                            "access_token": fake_jwt(
+                                {
+                                    "https://api.openai.com/profile": {
+                                        "email": "person@example.com"
+                                    }
+                                }
+                            )
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            hermes_agent = root / "hermes-agent"
+            python = hermes_agent / "venv" / "bin" / "python"
+            auth_module = hermes_agent / "hermes_cli" / "auth.py"
+            python.parent.mkdir(parents=True)
+            auth_module.parent.mkdir(parents=True)
+            python.write_text("#!/bin/sh\n", encoding="utf-8")
+            python.chmod(0o700)
+            auth_module.write_text("# fake hermes auth module\n", encoding="utf-8")
+
+            calls = []
+
+            def fake_run(command, **kwargs):
+                calls.append(command)
+                if len(command) >= 3 and command[1] == "-c":
+                    return mock.Mock(
+                        returncode=0,
+                        stdout=(
+                            '{"status":"synced","config":"/tmp/hermes/config.yaml",'
+                            '"runtime":"auto"}\n'
+                        ),
+                        stderr="",
+                    )
+                if len(command) >= 3 and command[2] in {
+                    "import-environment",
+                    "unset-environment",
+                }:
+                    return mock.Mock(returncode=0, stdout="", stderr="")
+                if command[-3:] == ["is-active", "--quiet", "hermes-gateway.service"]:
+                    return mock.Mock(returncode=0, stdout="", stderr="")
+                if command[-2:] == ["restart", "hermes-gateway.service"]:
+                    return mock.Mock(returncode=0, stdout="", stderr="")
+                raise AssertionError(f"unexpected command: {command}")
+
+            provider = CodexProvider(codex_home=codex_home)
+            with mock.patch("ai_auth_switch.sync.shutil.which", return_value="/bin/systemctl"):
+                with mock.patch.dict(
+                    os.environ,
+                    {"http_proxy": "http://127.0.0.1:7897"},
+                    clear=True,
+                ):
+                    with mock.patch("ai_auth_switch.sync.subprocess.run", fake_run):
+                        results = sync_codex_dependents(
+                            provider,
+                            sync_openclaw=False,
+                            hermes_agent_dir=hermes_agent,
+                        )
+
+            self.assertEqual(
+                [result.target for result in results],
+                ["hermes", "hermes-gateway"],
+            )
+            self.assertTrue(all(result.ok for result in results))
+            self.assertIn(
+                ["/bin/systemctl", "--user", "import-environment", "http_proxy"],
+                calls,
+            )
+            self.assertEqual(
+                calls[-1],
+                ["/bin/systemctl", "--user", "restart", "hermes-gateway.service"],
+            )
 
     def test_sync_codex_dependents_updates_openclaw_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -440,6 +526,128 @@ class CodexStoreTests(unittest.TestCase):
             self.assertEqual(state["order"]["openai-codex"], [OPENAI_CODEX_DEFAULT_PROFILE])
             self.assertEqual(state["lastGood"]["openai-codex"], OPENAI_CODEX_DEFAULT_PROFILE)
             self.assertNotIn(OPENAI_CODEX_DEFAULT_PROFILE, state["usageStats"])
+
+    def test_sync_codex_dependents_updates_openclaw_sqlite_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            access_token = fake_jwt(
+                {
+                    "exp": 4102444800,
+                    "https://api.openai.com/profile": {"email": "person@example.com"},
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": "acc_access",
+                        "chatgpt_plan_type": "pro",
+                    },
+                }
+            )
+            id_token = fake_jwt(
+                {
+                    "email": "person@example.com",
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": "acc_id",
+                        "chatgpt_plan_type": "plus",
+                    },
+                }
+            )
+            (codex_home / "auth.json").write_text(
+                json.dumps(
+                    {
+                        "auth_mode": "chatgpt",
+                        "tokens": {
+                            "access_token": access_token,
+                            "refresh_token": "rt_test",
+                            "id_token": id_token,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            openclaw = root / ".openclaw"
+            agent = openclaw / "agents" / "main" / "agent"
+            agent.mkdir(parents=True)
+            sqlite_path = agent / "openclaw-agent.sqlite"
+            with sqlite3.connect(sqlite_path) as conn:
+                conn.execute(
+                    "create table auth_profile_store("
+                    "store_key text primary key, store_json text, updated_at integer)"
+                )
+                conn.execute(
+                    "create table auth_profile_state("
+                    "state_key text primary key, state_json text, updated_at integer)"
+                )
+                conn.execute(
+                    "insert into auth_profile_store(store_key, store_json, updated_at) "
+                    "values('primary', ?, 1)",
+                    (
+                        json.dumps(
+                            {
+                                "version": 1,
+                                "profiles": {
+                                    "openai:old@example.com": {
+                                        "type": "oauth",
+                                        "provider": "openai",
+                                    },
+                                    "vllm:default": {"type": "api_key", "provider": "vllm"},
+                                },
+                            }
+                        ),
+                    ),
+                )
+                conn.execute(
+                    "insert into auth_profile_state(state_key, state_json, updated_at) "
+                    "values('primary', ?, 1)",
+                    (
+                        json.dumps(
+                            {
+                                "version": 1,
+                                "order": {"openai-codex": ["openai-codex:default"]},
+                                "lastGood": {},
+                                "usageStats": {OPENAI_DEFAULT_PROFILE: {"errorCount": 3}},
+                            }
+                        ),
+                    ),
+                )
+
+            provider = CodexProvider(codex_home=codex_home)
+            results = sync_codex_dependents(
+                provider,
+                sync_hermes=False,
+                restart_openclaw=False,
+                openclaw_state_dir=openclaw,
+            )
+
+            self.assertEqual([result.target for result in results], ["openclaw"])
+            self.assertTrue(results[0].ok)
+            self.assertIn("OpenClaw SQLite openai:default", results[0].message)
+
+            with sqlite3.connect(sqlite_path) as conn:
+                store = json.loads(
+                    conn.execute(
+                        "select store_json from auth_profile_store where store_key='primary'"
+                    ).fetchone()[0]
+                )
+                state = json.loads(
+                    conn.execute(
+                        "select state_json from auth_profile_state where state_key='primary'"
+                    ).fetchone()[0]
+                )
+
+            profile = store["profiles"][OPENAI_DEFAULT_PROFILE]
+            self.assertEqual(profile["type"], "oauth")
+            self.assertEqual(profile["provider"], "openai")
+            self.assertEqual(profile["access"], access_token)
+            self.assertEqual(profile["refresh"], "rt_test")
+            self.assertEqual(profile["idToken"], id_token)
+            self.assertEqual(profile["email"], "person@example.com")
+            self.assertEqual(profile["accountId"], "acc_id")
+            self.assertEqual(profile["chatgptPlanType"], "plus")
+            self.assertEqual(profile["expires"], 4102444800 * 1000)
+            self.assertEqual(state["order"]["openai"], [OPENAI_DEFAULT_PROFILE])
+            self.assertEqual(state["lastGood"]["openai"], OPENAI_DEFAULT_PROFILE)
+            self.assertNotIn(OPENAI_DEFAULT_PROFILE, state["usageStats"])
 
     def test_cli_auth_sync_updates_openclaw_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

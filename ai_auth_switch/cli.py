@@ -169,6 +169,7 @@ def _cmd_auth_sync(args: argparse.Namespace) -> int:
         provider,
         sync_hermes=not args.no_hermes,
         sync_openclaw=not args.no_openclaw,
+        restart_hermes=not args.no_hermes_restart,
         restart_openclaw=not args.no_openclaw_restart,
         hermes_login=args.hermes_login,
         hermes_profile_name=current.name if current else None,
@@ -338,6 +339,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--hermes-login",
         action="store_true",
         help="Deprecated compatibility option; Hermes now uses Codex CLI auth via bridge sync.",
+    )
+    auth_sync.add_argument(
+        "--no-hermes-restart",
+        action="store_true",
+        help="Do not restart hermes-gateway.service after Hermes sync.",
     )
     auth_sync.add_argument(
         "--no-openclaw",

@@ -44,8 +44,11 @@ syncs those dependent tool states:
 
 - Hermes is pointed at `openai-codex` and switched to Hermes's
   `openai_runtime=auto` path with a credential-pool entry seeded from the
-  active Codex CLI access token.
-- OpenClaw is pointed at `openai-codex:default`, which is the Codex CLI auth
+  active Codex CLI access token. If `hermes-gateway.service` is active, it is
+  restarted so messaging channels such as Feishu reload auth and environment.
+- Current OpenClaw installs are synchronized through the SQLite auth store by
+  writing `openai:default` from the active Codex CLI OAuth token. Older JSON
+  auth-state installs fall back to `openai-codex:default`, the legacy Codex CLI
   bridge profile.
 - If `openclaw-gateway.service` is active, it is restarted so the new auth is
   picked up immediately.
@@ -64,11 +67,26 @@ The same operation can be run explicitly:
 ai-auth-switch auth sync codex
 ```
 
+Before restarting active systemd user gateway services, the sync imports the
+current process's standard proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`,
+`ALL_PROXY`, `NO_PROXY`, and lowercase variants) into the systemd user manager
+and unsets absent proxy variables there. This lets Hermes/OpenClaw inherit the
+caller's proxy environment instead of depending on a fixed `EnvironmentFile`.
+
+For OpenClaw, the sync prefers `~/.openclaw/agents/main/agent/openclaw-agent.sqlite`
+when it exists. It updates `auth_profile_store` and `auth_profile_state`, sets
+`order.openai` and `lastGood.openai` to `openai:default`, and removes stale
+`usageStats` for that profile so a previous auth failure cooldown does not keep
+blocking the freshly synced token. If the SQLite store is absent, the sync uses
+the older `auth-profiles.json` / `auth-state.json` files instead.
+
 The deprecated `--hermes-login` flag is accepted for compatibility but does not
-start a separate Hermes device-code login:
+start a separate Hermes device-code login. `--no-hermes-restart` can be used on
+manual syncs when the gateway should be left running:
 
 ```bash
 ai-auth-switch auth sync codex --hermes-login
+ai-auth-switch auth sync codex --no-hermes-restart
 ```
 
 ## Wrapper

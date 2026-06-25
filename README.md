@@ -63,8 +63,11 @@ Codex-dependent local tools:
 
 - Hermes is pointed at `openai-codex` and seeded with a Codex CLI access-token
   pool entry, so it follows the active Codex CLI account without handing turns
-  to `codex app-server`.
-- OpenClaw is pointed at its Codex CLI default profile.
+  to `codex app-server`. If `hermes-gateway.service` is active, it is restarted
+  so Feishu and other messaging channels pick up the new auth immediately.
+- Current OpenClaw installs are synchronized through the SQLite auth store by
+  writing `openai:default` from the active Codex CLI OAuth token. Older JSON
+  auth-state installs still use the legacy `openai-codex:default` bridge.
 
 You can run that step explicitly too:
 
@@ -75,8 +78,11 @@ ai-auth-switch auth sync codex
 Hermes does not import or share the Codex CLI refresh token. The sync clears
 Hermes's old independent `openai-codex` OAuth state, installs the current Codex
 CLI access token into Hermes's `openai-codex` credential pool, and leaves
-Hermes's `openai_runtime` on `auto`. OpenClaw is updated to use the Codex CLI
-bridge profile `openai-codex:default`.
+Hermes's `openai_runtime` on `auto`. Current OpenClaw versions no longer import
+Codex CLI auth from `~/.codex` at runtime, so the sync writes the active Codex
+OAuth tokens into OpenClaw's own SQLite auth store as `openai:default` and
+clears any failure cooldown for that profile. Older OpenClaw JSON auth-state
+installs still fall back to the legacy `openai-codex:default` bridge profile.
 
 The old Hermes login flag is kept only for command compatibility and is now a
 no-op:
@@ -85,7 +91,12 @@ no-op:
 ai-auth-switch auth sync codex --hermes-login
 ```
 
-Use `ai-auth-switch auth sync codex` normally.
+Use `ai-auth-switch auth sync codex` normally. Before restarting active gateway
+services, the current process's standard proxy variables (`http_proxy`,
+`https_proxy`, and their uppercase variants) are imported into the systemd user
+manager, so Hermes/OpenClaw do not need a hard-coded proxy env file. To leave a
+running Hermes gateway untouched during an explicit sync, pass
+`--no-hermes-restart`.
 
 If Codex reports that a refresh token was already used after switching
 profiles, that profile's stored refresh token has already been invalidated by
@@ -148,7 +159,7 @@ AI_AUTH_SWITCH_HOME=/secure/path ai-auth-switch auth list codex
 `ai-auth-switch` has three separate layers:
 
 - Auth management: save, list, activate, rename, remove, and inspect profiles.
-- Dependent sync: point Hermes and OpenClaw at the active Codex CLI auth bridge.
+- Dependent sync: point Hermes and OpenClaw at the active Codex CLI auth.
 - Wrapper: run a command under a selected profile without permanently changing
   the active profile after the command exits.
 
