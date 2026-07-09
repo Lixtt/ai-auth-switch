@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -96,6 +97,14 @@ class ProfileInfo:
     by_content: bool = False
 
 
+@dataclass(frozen=True)
+class AliasInfo:
+    name: str
+    provider_id: str
+    profile: str
+    command: tuple[str, ...]
+
+
 class AuthStore:
     def __init__(self, base_dir: Path | None = None):
         self.base_dir = (base_dir or default_store_dir()).expanduser()
@@ -110,6 +119,9 @@ class AuthStore:
 
     def backups_dir(self, provider: Provider) -> Path:
         return self.base_dir / "backups" / provider.id
+
+    def aliases_path(self) -> Path:
+        return self.base_dir / "aliases.json"
 
     def profile_path(self, provider: Provider, name: str) -> Path:
         clean = sanitize_profile_name(name)
@@ -259,6 +271,49 @@ class AuthStore:
             return ProfileInfo(name=new_path.stem, path=new_path, active=True)
         return ProfileInfo(name=new_path.stem, path=new_path, active=False)
 
+    def list_aliases(self) -> list[AliasInfo]:
+        aliases = self._read_aliases()
+        return [aliases[name] for name in sorted(aliases)]
+
+    def resolve_alias(self, name: str) -> AliasInfo | None:
+        clean = sanitize_profile_name(name)
+        return self._read_aliases().get(clean)
+
+    def set_alias(
+        self,
+        provider: Provider,
+        name: str,
+        profile: str,
+        command: list[str] | tuple[str, ...] | None = None,
+    ) -> AliasInfo:
+        clean_name = sanitize_profile_name(name)
+        clean_profile = sanitize_profile_name(profile)
+        profile_path = self.profile_path(provider, clean_profile)
+        if not profile_path.exists():
+            raise AiAuthSwitchError(f"profile not found: {profile}")
+
+        normalized_command = tuple(str(part) for part in (command or provider.login_command))
+        if not normalized_command:
+            raise AiAuthSwitchError(f"alias command cannot be empty: {name}")
+
+        aliases = self._read_aliases()
+        aliases[clean_name] = AliasInfo(
+            name=clean_name,
+            provider_id=provider.id,
+            profile=profile_path.stem,
+            command=normalized_command,
+        )
+        self._write_aliases(aliases)
+        return aliases[clean_name]
+
+    def remove_alias(self, name: str) -> None:
+        clean = sanitize_profile_name(name)
+        aliases = self._read_aliases()
+        if clean not in aliases:
+            raise AiAuthSwitchError(f"alias not found: {name}")
+        del aliases[clean]
+        self._write_aliases(aliases)
+
     @contextlib.contextmanager
     def activated_temporarily(self, provider: Provider, name: str) -> Iterator[ProfileInfo]:
         active = provider.active_auth_path
@@ -343,3 +398,62 @@ class AuthStore:
         set_private_permissions(tmp)
         os.replace(tmp, profile_path)
         set_private_permissions(profile_path)
+
+    def _read_aliases(self) -> dict[str, AliasInfo]:
+        path = self.aliases_path()
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise AiAuthSwitchError(f"failed to read aliases: {path}: {exc}") from exc
+
+        raw_aliases = data.get("aliases") if isinstance(data, dict) else None
+        if not isinstance(raw_aliases, dict):
+            return {}
+
+        aliases: dict[str, AliasInfo] = {}
+        for raw_name, raw_info in raw_aliases.items():
+            if not isinstance(raw_name, str) or not isinstance(raw_info, dict):
+                continue
+            provider_id = raw_info.get("provider")
+            profile = raw_info.get("profile")
+            command = raw_info.get("command")
+            if (
+                not isinstance(provider_id, str)
+                or not provider_id.strip()
+                or not isinstance(profile, str)
+                or not profile.strip()
+            ):
+                continue
+            if not isinstance(command, list) or not all(
+                isinstance(part, str) and part for part in command
+            ):
+                continue
+            aliases[sanitize_profile_name(raw_name)] = AliasInfo(
+                name=sanitize_profile_name(raw_name),
+                provider_id=provider_id.strip(),
+                profile=sanitize_profile_name(profile),
+                command=tuple(command),
+            )
+        return aliases
+
+    def _write_aliases(self, aliases: dict[str, AliasInfo]) -> None:
+        self.ensure()
+        path = self.aliases_path()
+        tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
+        payload = {
+            "version": 1,
+            "aliases": {
+                alias.name: {
+                    "provider": alias.provider_id,
+                    "profile": alias.profile,
+                    "command": list(alias.command),
+                }
+                for alias in sorted(aliases.values(), key=lambda item: item.name)
+            },
+        }
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        set_private_permissions(tmp)
+        os.replace(tmp, path)
+        set_private_permissions(path)

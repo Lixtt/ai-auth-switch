@@ -128,6 +128,24 @@ previous active auth:
 ai-auth-switch run codex someone@example.com -- codex -C ~/workspace/project
 ```
 
+Create command aliases for frequently used accounts:
+
+```bash
+ai-auth-switch alias set codex1 codex someone@example.com
+ai-auth-switch alias set codex2 codex other@example.com
+ai-auth-switch alias install codex1
+ai-auth-switch alias install codex2
+```
+
+After installation, `codex1 -C ~/workspace/project` runs the Codex CLI under
+the `someone@example.com` profile and restores the previous active auth when the
+process exits. The default alias command is `codex`; pass a command after `--`
+to customize it:
+
+```bash
+ai-auth-switch alias set codex1 codex someone@example.com -- /path/to/codex
+```
+
 ## Directory Overrides
 
 By default Codex auth is read from:

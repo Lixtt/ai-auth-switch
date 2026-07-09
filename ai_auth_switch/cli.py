@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -11,12 +12,20 @@ from typing import Sequence
 from ai_auth_switch import __version__
 from ai_auth_switch.errors import AiAuthSwitchError
 from ai_auth_switch.providers import Provider, get_provider
-from ai_auth_switch.store import AuthStore
+from ai_auth_switch.store import AliasInfo, AuthStore
 from ai_auth_switch.sync import SyncResult, sync_codex_dependents
 from ai_auth_switch.wrapper import run_with_profile
 
 
 SUPPORTED_PROVIDERS = ["codex"]
+PROGRAM_NAMES = {
+    "ai-auth-switch",
+    "ai-auth-switch.py",
+    "cli.py",
+    "__main__.py",
+    "python",
+    "python3",
+}
 
 
 def _strip_separator(args: Sequence[str]) -> list[str]:
@@ -282,6 +291,117 @@ def _cmd_run(args: argparse.Namespace) -> int:
     )
 
 
+def _alias_display(alias: AliasInfo) -> str:
+    command = " ".join(alias.command)
+    return f"{alias.name} -> {alias.provider_id}:{alias.profile} -- {command}"
+
+
+def _run_alias(
+    store: AuthStore,
+    alias: AliasInfo,
+    extra_args: Sequence[str],
+    *,
+    provider: Provider | None = None,
+) -> int:
+    provider = provider or get_provider(alias.provider_id)
+    command = list(alias.command) + _strip_separator(extra_args)
+    return run_with_profile(store, provider, alias.profile, command)
+
+
+def _cmd_alias_list(args: argparse.Namespace) -> int:
+    store = _store_from_args(args)
+    with store.lock():
+        aliases = store.list_aliases()
+    if not aliases:
+        print("no aliases")
+        return 0
+    for alias in aliases:
+        print(_alias_display(alias))
+    return 0
+
+
+def _cmd_alias_set(args: argparse.Namespace) -> int:
+    provider = _provider_from_args(args)
+    store = _store_from_args(args)
+    command = _strip_separator(args.command)
+    with store.lock():
+        alias = store.set_alias(provider, args.name, args.profile, command or None)
+    print(f"saved alias {_alias_display(alias)}")
+    return 0
+
+
+def _cmd_alias_remove(args: argparse.Namespace) -> int:
+    store = _store_from_args(args)
+    with store.lock():
+        store.remove_alias(args.name)
+    print(f"removed alias {args.name}")
+    return 0
+
+
+def _cmd_alias_run(args: argparse.Namespace) -> int:
+    store = _store_from_args(args)
+    with store.lock():
+        alias = store.resolve_alias(args.name)
+    if alias is None:
+        raise AiAuthSwitchError(f"alias not found: {args.name}")
+    provider = _provider_by_id(alias.provider_id, args)
+    return _run_alias(store, alias, args.command, provider=provider)
+
+
+def _cmd_alias_install(args: argparse.Namespace) -> int:
+    store = _store_from_args(args)
+    with store.lock():
+        alias = store.resolve_alias(args.name)
+    if alias is None:
+        raise AiAuthSwitchError(f"alias not found: {args.name}")
+
+    bin_dir = Path(args.bin_dir).expanduser() if args.bin_dir else Path.home() / ".local/bin"
+    target = (
+        Path(args.target).expanduser()
+        if args.target
+        else Path(shutil.which("ai-auth-switch") or sys.argv[0]).resolve()
+    )
+    if not target.exists():
+        raise AiAuthSwitchError(f"ai-auth-switch executable not found: {target}")
+
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    link = bin_dir / alias.name
+    if link.exists() or link.is_symlink():
+        if not args.force:
+            raise AiAuthSwitchError(f"alias executable already exists: {link}")
+        link.unlink()
+    os.symlink(target, link)
+    print(f"installed {alias.name} -> {target}")
+    return 0
+
+
+def _program_alias_name(program_name: str) -> str | None:
+    name = Path(program_name).name
+    if name in PROGRAM_NAMES or name.startswith("ai-auth-switch"):
+        return None
+    return name
+
+
+def _maybe_run_program_alias(
+    argv: Sequence[str],
+    *,
+    program_name: str,
+) -> int | None:
+    alias_name = _program_alias_name(program_name)
+    if alias_name is None:
+        return None
+
+    store = AuthStore()
+    with store.lock():
+        alias = store.resolve_alias(alias_name)
+    if alias is None:
+        raise AiAuthSwitchError(
+            f"alias not found for executable {alias_name!r}; "
+            f"run `ai-auth-switch alias set {alias_name} codex <profile>` first"
+        )
+    return _run_alias(store, alias, argv)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ai-auth-switch",
@@ -382,13 +502,62 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("command", nargs=argparse.REMAINDER)
     run.set_defaults(func=_cmd_run)
 
+    alias = subparsers.add_parser("alias", help="Manage command aliases.")
+    alias_sub = alias.add_subparsers(dest="alias_command", required=True)
+
+    alias_list = alias_sub.add_parser("list", help="List command aliases.")
+    alias_list.set_defaults(func=_cmd_alias_list)
+
+    alias_set = alias_sub.add_parser("set", help="Create or update a command alias.")
+    alias_set.add_argument("name", help="Alias executable name, for example codex1.")
+    alias_set.add_argument("provider", choices=SUPPORTED_PROVIDERS)
+    alias_set.add_argument("profile", help="Saved provider profile to activate.")
+    alias_set.add_argument(
+        "command",
+        nargs=argparse.REMAINDER,
+        help="Command to run after '--'. Defaults to the provider command.",
+    )
+    alias_set.set_defaults(func=_cmd_alias_set)
+
+    alias_remove = alias_sub.add_parser("remove", help="Remove a command alias.")
+    alias_remove.add_argument("name")
+    alias_remove.set_defaults(func=_cmd_alias_remove)
+
+    alias_run = alias_sub.add_parser("run", help="Run a command alias by name.")
+    alias_run.add_argument("name")
+    alias_run.add_argument("command", nargs=argparse.REMAINDER)
+    alias_run.set_defaults(func=_cmd_alias_run)
+
+    alias_install = alias_sub.add_parser(
+        "install",
+        help="Install a symlink so the alias can be invoked directly.",
+    )
+    alias_install.add_argument("name")
+    alias_install.add_argument("--bin-dir", help="Directory for the alias symlink.")
+    alias_install.add_argument("--target", help="ai-auth-switch executable target.")
+    alias_install.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace an existing alias executable.",
+    )
+    alias_install.set_defaults(func=_cmd_alias_install)
+
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None, *, program_name: str | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     try:
+        if program_name is not None or argv is None:
+            alias_status = _maybe_run_program_alias(
+                raw_argv,
+                program_name=program_name or sys.argv[0],
+            )
+            if alias_status is not None:
+                return int(alias_status)
+
+        args = parser.parse_args(raw_argv)
         return int(args.func(args))
     except AiAuthSwitchError as exc:
         print(f"ai-auth-switch: {exc}", file=sys.stderr)

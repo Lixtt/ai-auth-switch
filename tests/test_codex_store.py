@@ -231,6 +231,167 @@ class CodexStoreTests(unittest.TestCase):
             self.assertIn("unmanaged codex auth found", output)
             self.assertIn("person@example.com", output)
 
+    def test_cli_alias_set_list_and_run_uses_selected_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            store_dir = root / "store"
+            codex_home.mkdir()
+            provider = CodexProvider(codex_home=codex_home)
+            store = AuthStore(store_dir)
+
+            for name in ("a@example.com", "b@example.com"):
+                active = codex_home / "auth.json"
+                if active.exists() or active.is_symlink():
+                    active.unlink()
+                active.write_text(
+                    json.dumps({"auth_mode": "chatgpt", "email": name}),
+                    encoding="utf-8",
+                )
+                with store.lock():
+                    store.save_current(provider, name)
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                status = cli_main(
+                    [
+                        "--store-dir",
+                        str(store_dir),
+                        "--codex-home",
+                        str(codex_home),
+                        "alias",
+                        "set",
+                        "codex1",
+                        "codex",
+                        "a@example.com",
+                        "--",
+                        "fake-codex",
+                    ]
+                )
+            self.assertEqual(status, 0)
+
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                status = cli_main(["--store-dir", str(store_dir), "alias", "list"])
+            self.assertEqual(status, 0)
+            self.assertIn("codex1 -> codex:a@example.com -- fake-codex", out.getvalue())
+
+            calls = []
+
+            def fake_call(command):
+                calls.append(command)
+                current = store.current_profile(provider)
+                self.assertIsNotNone(current)
+                self.assertEqual(current.name, "a@example.com")
+                return 0
+
+            with mock.patch("ai_auth_switch.wrapper.subprocess.call", fake_call):
+                status = cli_main(
+                    [
+                        "--store-dir",
+                        str(store_dir),
+                        "--codex-home",
+                        str(codex_home),
+                        "alias",
+                        "run",
+                        "codex1",
+                        "--",
+                        "-C",
+                        "/tmp/workspace",
+                    ]
+                )
+
+            self.assertEqual(status, 0)
+            self.assertEqual(calls, [["fake-codex", "-C", "/tmp/workspace"]])
+            self.assertEqual(store.current_profile(provider).name, "b@example.com")
+
+    def test_program_name_alias_dispatches_directly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            store_dir = root / "store"
+            codex_home.mkdir()
+            provider = CodexProvider(codex_home=codex_home)
+            store = AuthStore(store_dir)
+
+            for name in ("a@example.com", "b@example.com"):
+                active = codex_home / "auth.json"
+                if active.exists() or active.is_symlink():
+                    active.unlink()
+                active.write_text(
+                    json.dumps({"auth_mode": "chatgpt", "email": name}),
+                    encoding="utf-8",
+                )
+                with store.lock():
+                    store.save_current(provider, name)
+
+            with store.lock():
+                store.set_alias(provider, "codex1", "a@example.com", ["fake-codex"])
+
+            calls = []
+
+            def fake_call(command):
+                calls.append(command)
+                current = store.current_profile(provider)
+                self.assertIsNotNone(current)
+                self.assertEqual(current.name, "a@example.com")
+                return 0
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "AI_AUTH_SWITCH_HOME": str(store_dir),
+                    "CODEX_HOME": str(codex_home),
+                },
+            ):
+                with mock.patch("ai_auth_switch.wrapper.subprocess.call", fake_call):
+                    status = cli_main(["-C", "/tmp/workspace"], program_name="codex1")
+
+            self.assertEqual(status, 0)
+            self.assertEqual(calls, [["fake-codex", "-C", "/tmp/workspace"]])
+            self.assertEqual(store.current_profile(provider).name, "b@example.com")
+
+    def test_cli_alias_install_creates_executable_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            store_dir = root / "store"
+            bin_dir = root / "bin"
+            codex_home.mkdir()
+            provider = CodexProvider(codex_home=codex_home)
+            store = AuthStore(store_dir)
+
+            active = codex_home / "auth.json"
+            active.write_text(
+                json.dumps({"auth_mode": "chatgpt", "email": "a@example.com"}),
+                encoding="utf-8",
+            )
+            with store.lock():
+                store.save_current(provider, "a@example.com")
+                store.set_alias(provider, "codex1", "a@example.com", ["fake-codex"])
+
+            target = root / "ai-auth-switch-target"
+            target.write_text("#!/bin/sh\n", encoding="utf-8")
+            target.chmod(0o700)
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                status = cli_main(
+                    [
+                        "--store-dir",
+                        str(store_dir),
+                        "alias",
+                        "install",
+                        "codex1",
+                        "--bin-dir",
+                        str(bin_dir),
+                        "--target",
+                        str(target),
+                    ]
+                )
+
+            link = bin_dir / "codex1"
+            self.assertEqual(status, 0)
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(link.resolve(), target.resolve())
 
     def test_cli_auth_login_syncs_hermes_without_second_login(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
