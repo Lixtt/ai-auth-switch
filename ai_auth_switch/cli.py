@@ -6,13 +6,18 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
 from ai_auth_switch import __version__
 from ai_auth_switch.errors import AiAuthSwitchError
 from ai_auth_switch.providers import Provider, get_provider
-from ai_auth_switch.store import AliasInfo, AuthStore
+from ai_auth_switch.store import (
+    AliasInfo,
+    AuthStore,
+    numbered_codex_alias_index,
+)
 from ai_auth_switch.sync import SyncResult, sync_codex_dependents
 from ai_auth_switch.wrapper import run_with_profile
 
@@ -26,6 +31,14 @@ PROGRAM_NAMES = {
     "python",
     "python3",
 }
+AUTO_ALIAS_BIN_DIR_ENV = "AI_AUTH_SWITCH_ALIAS_BIN_DIR"
+
+
+@dataclass(frozen=True)
+class AliasLinkSyncResult:
+    installed: tuple[Path, ...] = ()
+    removed: tuple[Path, ...] = ()
+    conflicts: tuple[Path, ...] = ()
 
 
 def _strip_separator(args: Sequence[str]) -> list[str]:
@@ -54,6 +67,131 @@ def _provider_ids(args: argparse.Namespace) -> list[str]:
 def _provider_by_id(provider_id: str, args: argparse.Namespace) -> Provider:
     codex_home = Path(args.codex_home).expanduser() if args.codex_home else None
     return get_provider(provider_id, codex_home=codex_home)
+
+
+def _alias_executable_target(target: str | Path | None = None) -> Path:
+    candidate = (
+        Path(target).expanduser()
+        if target is not None
+        else Path(shutil.which("ai-auth-switch") or sys.argv[0]).expanduser()
+    )
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise AiAuthSwitchError(f"ai-auth-switch executable not found: {candidate}") from exc
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise AiAuthSwitchError(f"ai-auth-switch executable not found: {candidate}")
+    return resolved
+
+
+def _symlink_points_to(link: Path, target: Path) -> bool:
+    if not link.is_symlink():
+        return False
+    try:
+        raw_target = Path(os.readlink(link))
+    except OSError:
+        return False
+    if not raw_target.is_absolute():
+        raw_target = link.parent / raw_target
+    return raw_target.resolve() == target.resolve()
+
+
+def _sync_numbered_alias_executables(
+    aliases: Sequence[AliasInfo],
+    *,
+    bin_dir: Path,
+    target: Path,
+) -> AliasLinkSyncResult:
+    automatic = {
+        alias.name: alias
+        for alias in aliases
+        if alias.provider_id == "codex"
+        and numbered_codex_alias_index(alias.name) is not None
+    }
+    try:
+        bin_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise AiAuthSwitchError(f"failed to create alias directory {bin_dir}: {exc}") from exc
+
+    installed: list[Path] = []
+    removed: list[Path] = []
+    conflicts: list[Path] = []
+    for name in sorted(automatic, key=lambda item: numbered_codex_alias_index(item) or 0):
+        link = bin_dir / name
+        if not link.exists() and not link.is_symlink():
+            try:
+                os.symlink(target, link)
+            except OSError as exc:
+                raise AiAuthSwitchError(
+                    f"failed to install automatic alias {link}: {exc}"
+                ) from exc
+            installed.append(link)
+        elif not _symlink_points_to(link, target):
+            conflicts.append(link)
+
+    try:
+        candidates = list(bin_dir.iterdir())
+    except OSError as exc:
+        raise AiAuthSwitchError(f"failed to inspect alias directory {bin_dir}: {exc}") from exc
+    for link in candidates:
+        if (
+            numbered_codex_alias_index(link.name) is not None
+            and link.name not in automatic
+            and _symlink_points_to(link, target)
+        ):
+            try:
+                link.unlink()
+            except OSError as exc:
+                raise AiAuthSwitchError(
+                    f"failed to remove stale automatic alias {link}: {exc}"
+                ) from exc
+            removed.append(link)
+
+    return AliasLinkSyncResult(
+        installed=tuple(installed),
+        removed=tuple(removed),
+        conflicts=tuple(conflicts),
+    )
+
+
+def _automatic_alias_bin_dir(args: argparse.Namespace) -> Path | None:
+    configured = os.environ.get(AUTO_ALIAS_BIN_DIR_ENV)
+    if configured and configured.strip():
+        return Path(configured).expanduser()
+    if getattr(args, "store_dir", None):
+        return None
+    return Path.home() / ".local/bin"
+
+
+def _print_alias_link_sync(result: AliasLinkSyncResult) -> None:
+    for link in result.installed:
+        print(f"installed automatic alias {link.name} -> {os.readlink(link)}")
+    for link in result.removed:
+        print(f"removed stale automatic alias {link.name}")
+    for link in result.conflicts:
+        print(
+            f"ai-auth-switch: automatic alias not installed; path already exists: {link}",
+            file=sys.stderr,
+        )
+
+
+def _sync_automatic_alias_links(
+    args: argparse.Namespace,
+    aliases: Sequence[AliasInfo],
+) -> None:
+    bin_dir = _automatic_alias_bin_dir(args)
+    if bin_dir is None:
+        return
+    try:
+        result = _sync_numbered_alias_executables(
+            aliases,
+            bin_dir=bin_dir,
+            target=_alias_executable_target(),
+        )
+    except AiAuthSwitchError as exc:
+        print(f"ai-auth-switch: automatic alias sync failed: {exc}", file=sys.stderr)
+        return
+    _print_alias_link_sync(result)
 
 
 def _auth_hint(provider: Provider) -> str:
@@ -112,6 +250,11 @@ def _cmd_auth_list(args: argparse.Namespace) -> int:
         for index, provider_id in enumerate(provider_ids):
             provider = _provider_by_id(provider_id, args)
             profiles = store.list_profiles(provider)
+            automatic_aliases = store.sync_numbered_aliases(provider)
+            _sync_automatic_alias_links(args, automatic_aliases)
+            aliases_by_profile = {
+                alias.profile: alias.name for alias in automatic_aliases
+            }
             if len(provider_ids) > 1:
                 if index:
                     print()
@@ -124,6 +267,9 @@ def _cmd_auth_list(args: argparse.Namespace) -> int:
             for profile in profiles:
                 mark = "*" if profile.active else " "
                 suffix = " (content match)" if profile.by_content else ""
+                alias_name = aliases_by_profile.get(profile.name)
+                if alias_name:
+                    suffix += f" [{alias_name}]"
                 prefix = "  " if len(provider_ids) > 1 else ""
                 print(f"{prefix}{mark} {profile.name}{suffix}")
     return 0
@@ -136,6 +282,8 @@ def _cmd_auth_current(args: argparse.Namespace) -> int:
     with store.lock():
         for provider_id in provider_ids:
             provider = _provider_by_id(provider_id, args)
+            automatic_aliases = store.sync_numbered_aliases(provider)
+            _sync_automatic_alias_links(args, automatic_aliases)
             current = store.current_profile(provider)
             prefix = f"{provider.id}: " if len(provider_ids) > 1 else ""
             if current is None:
@@ -153,6 +301,8 @@ def _cmd_auth_save(args: argparse.Namespace) -> int:
     store = _store_from_args(args)
     with store.lock():
         profile = store.save_current(provider, args.name)
+        automatic_aliases = store.sync_numbered_aliases(provider)
+        _sync_automatic_alias_links(args, automatic_aliases)
     print(f"saved {provider.id} auth as {profile.name}")
     print(f"active {provider.id} auth -> {profile.path}")
     _sync_after_auth_change(args, provider, store, profile_name=profile.name)
@@ -164,6 +314,8 @@ def _cmd_auth_use(args: argparse.Namespace) -> int:
     store = _store_from_args(args)
     with store.lock():
         profile = store.activate(provider, args.name)
+        automatic_aliases = store.sync_numbered_aliases(provider)
+        _sync_automatic_alias_links(args, automatic_aliases)
     print(f"active {provider.id} auth -> {profile.name}")
     _sync_after_auth_change(args, provider, store, profile_name=profile.name)
     return 0
@@ -193,6 +345,8 @@ def _cmd_auth_remove(args: argparse.Namespace) -> int:
     store = _store_from_args(args)
     with store.lock():
         store.remove(provider, args.name)
+        automatic_aliases = store.sync_numbered_aliases(provider)
+        _sync_automatic_alias_links(args, automatic_aliases)
     print(f"removed {provider.id} profile {args.name}")
     return 0
 
@@ -202,6 +356,8 @@ def _cmd_auth_rename(args: argparse.Namespace) -> int:
     store = _store_from_args(args)
     with store.lock():
         profile = store.rename(provider, args.old, args.new)
+        automatic_aliases = store.sync_numbered_aliases(provider)
+        _sync_automatic_alias_links(args, automatic_aliases)
     print(f"renamed {provider.id} profile {args.old} -> {profile.name}")
     return 0
 
@@ -245,6 +401,8 @@ def _cmd_auth_login(args: argparse.Namespace) -> int:
         if had_active and backup.exists():
             backup.unlink()
 
+        automatic_aliases = store.sync_numbered_aliases(provider)
+        _sync_automatic_alias_links(args, automatic_aliases)
     print(f"saved {provider.id} login as {profile.name}")
     print(f"active {provider.id} auth -> {profile.path}")
     _sync_after_auth_change(
@@ -310,8 +468,11 @@ def _run_alias(
 
 def _cmd_alias_list(args: argparse.Namespace) -> int:
     store = _store_from_args(args)
+    provider = _provider_by_id("codex", args)
     with store.lock():
+        automatic_aliases = store.sync_numbered_aliases(provider)
         aliases = store.list_aliases()
+        _sync_automatic_alias_links(args, automatic_aliases)
     if not aliases:
         print("no aliases")
         return 0
@@ -326,16 +487,44 @@ def _cmd_alias_set(args: argparse.Namespace) -> int:
     command = _strip_separator(args.command)
     with store.lock():
         alias = store.set_alias(provider, args.name, args.profile, command or None)
+        automatic_aliases = store.sync_numbered_aliases(provider)
+        alias = store.resolve_alias(alias.name) or alias
+        _sync_automatic_alias_links(args, automatic_aliases)
     print(f"saved alias {_alias_display(alias)}")
     return 0
 
 
 def _cmd_alias_remove(args: argparse.Namespace) -> int:
+    if numbered_codex_alias_index(args.name) is not None:
+        raise AiAuthSwitchError(
+            f"{args.name} is managed automatically; remove its Codex profile instead"
+        )
     store = _store_from_args(args)
     with store.lock():
         store.remove_alias(args.name)
     print(f"removed alias {args.name}")
     return 0
+
+
+def _cmd_alias_sync(args: argparse.Namespace) -> int:
+    provider = _provider_from_args(args)
+    store = _store_from_args(args)
+    with store.lock():
+        aliases = store.sync_numbered_aliases(provider)
+        bin_dir = (
+            Path(args.bin_dir).expanduser()
+            if args.bin_dir
+            else Path.home() / ".local/bin"
+        )
+        result = _sync_numbered_alias_executables(
+            aliases,
+            bin_dir=bin_dir,
+            target=_alias_executable_target(args.target),
+        )
+    _print_alias_link_sync(result)
+    for alias in aliases:
+        print(f"synced alias {_alias_display(alias)}")
+    return 1 if result.conflicts else 0
 
 
 def _cmd_alias_run(args: argparse.Namespace) -> int:
@@ -356,13 +545,7 @@ def _cmd_alias_install(args: argparse.Namespace) -> int:
         raise AiAuthSwitchError(f"alias not found: {args.name}")
 
     bin_dir = Path(args.bin_dir).expanduser() if args.bin_dir else Path.home() / ".local/bin"
-    target = (
-        Path(args.target).expanduser()
-        if args.target
-        else Path(shutil.which("ai-auth-switch") or sys.argv[0]).resolve()
-    )
-    if not target.exists():
-        raise AiAuthSwitchError(f"ai-auth-switch executable not found: {target}")
+    target = _alias_executable_target(args.target)
 
     bin_dir.mkdir(parents=True, exist_ok=True)
     link = bin_dir / alias.name
@@ -507,6 +690,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     alias_list = alias_sub.add_parser("list", help="List command aliases.")
     alias_list.set_defaults(func=_cmd_alias_list)
+
+    alias_sync = alias_sub.add_parser(
+        "sync",
+        help="Create and install contiguous codex1, codex2, ... aliases.",
+    )
+    alias_sync.add_argument("provider", choices=SUPPORTED_PROVIDERS)
+    alias_sync.add_argument("--bin-dir", help="Directory for automatic alias symlinks.")
+    alias_sync.add_argument("--target", help="ai-auth-switch executable target.")
+    alias_sync.set_defaults(func=_cmd_alias_sync)
 
     alias_set = alias_sub.add_parser("set", help="Create or update a command alias.")
     alias_set.add_argument("name", help="Alias executable name, for example codex1.")

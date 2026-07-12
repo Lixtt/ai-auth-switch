@@ -39,6 +39,179 @@ def fake_jwt(payload: dict) -> str:
 
 
 class CodexStoreTests(unittest.TestCase):
+    def test_existing_profiles_get_numbered_aliases_in_saved_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            provider = CodexProvider(
+                codex_home=codex_home,
+                login_command=["fake-codex"],
+            )
+            store = AuthStore(root / "store")
+            profile_dir = store.provider_dir(provider)
+            profile_dir.mkdir(parents=True)
+
+            profiles = (
+                ("z-last-alphabetically@example.com", 1_000_000_000),
+                ("a-first-alphabetically@example.com", 2_000_000_000),
+            )
+            for name, modified_ns in profiles:
+                path = store.profile_path(provider, name)
+                path.write_text(json.dumps({"email": name}), encoding="utf-8")
+                os.utime(path, ns=(modified_ns, modified_ns))
+
+            with store.lock():
+                listed = store.list_profiles(provider)
+                aliases = store.list_aliases()
+
+            self.assertEqual(
+                [profile.name for profile in listed],
+                [
+                    "a-first-alphabetically@example.com",
+                    "z-last-alphabetically@example.com",
+                ],
+            )
+            self.assertEqual(
+                [(alias.name, alias.profile, alias.command) for alias in aliases],
+                [
+                    (
+                        "codex1",
+                        "z-last-alphabetically@example.com",
+                        ("fake-codex",),
+                    ),
+                    (
+                        "codex2",
+                        "a-first-alphabetically@example.com",
+                        ("fake-codex",),
+                    ),
+                ],
+            )
+
+    def test_numbered_aliases_append_and_compact_after_profile_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            provider = CodexProvider(
+                codex_home=codex_home,
+                login_command=["fake-codex"],
+            )
+            store = AuthStore(root / "store")
+
+            for name in ("z@example.com", "a@example.com", "m@example.com"):
+                active = codex_home / "auth.json"
+                if active.exists() or active.is_symlink():
+                    active.unlink()
+                active.write_text(json.dumps({"email": name}), encoding="utf-8")
+                with store.lock():
+                    store.save_current(provider, name)
+
+            with store.lock():
+                self.assertEqual(
+                    [alias.profile for alias in store.list_aliases()],
+                    ["z@example.com", "a@example.com", "m@example.com"],
+                )
+                store.set_alias(
+                    provider,
+                    "codex3",
+                    "m@example.com",
+                    ["custom-codex"],
+                )
+                store.set_alias(provider, "middle", "a@example.com", ["fake-codex"])
+                store.remove(provider, "a@example.com")
+                aliases = store.list_aliases()
+
+            self.assertEqual(
+                [(alias.name, alias.profile, alias.command) for alias in aliases],
+                [
+                    ("codex1", "z@example.com", ("fake-codex",)),
+                    ("codex2", "m@example.com", ("custom-codex",)),
+                ],
+            )
+            self.assertIsNone(store.resolve_alias("codex3"))
+            self.assertIsNone(store.resolve_alias("middle"))
+
+    def test_profile_rename_keeps_numbered_and_custom_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            provider = CodexProvider(
+                codex_home=codex_home,
+                login_command=["fake-codex"],
+            )
+            store = AuthStore(root / "store")
+            active = codex_home / "auth.json"
+            active.write_text(json.dumps({"email": "old@example.com"}), encoding="utf-8")
+
+            with store.lock():
+                store.save_current(provider, "old@example.com")
+                store.set_alias(provider, "work", "old@example.com", ["fake-codex"])
+                renamed = store.rename(provider, "old@example.com", "new@example.com")
+                aliases = store.list_aliases()
+
+            self.assertTrue(renamed.active)
+            self.assertEqual(store.current_profile(provider).name, "new@example.com")
+            self.assertEqual(
+                [(alias.name, alias.profile) for alias in aliases],
+                [("codex1", "new@example.com"), ("work", "new@example.com")],
+            )
+
+    def test_cli_alias_sync_installs_and_removes_numbered_executables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            store_dir = root / "store"
+            bin_dir = root / "bin"
+            codex_home.mkdir()
+            provider = CodexProvider(
+                codex_home=codex_home,
+                login_command=["fake-codex"],
+            )
+            store = AuthStore(store_dir)
+            profile_dir = store.provider_dir(provider)
+            profile_dir.mkdir(parents=True)
+            for index, name in enumerate(("first@example.com", "second@example.com"), start=1):
+                path = store.profile_path(provider, name)
+                path.write_text(json.dumps({"email": name}), encoding="utf-8")
+                os.utime(path, ns=(index, index))
+
+            target = root / "ai-auth-switch-target"
+            target.write_text("#!/bin/sh\n", encoding="utf-8")
+            target.chmod(0o700)
+
+            command = [
+                "--store-dir",
+                str(store_dir),
+                "--codex-home",
+                str(codex_home),
+                "alias",
+                "sync",
+                "codex",
+                "--bin-dir",
+                str(bin_dir),
+                "--target",
+                str(target),
+            ]
+            with contextlib.redirect_stdout(io.StringIO()):
+                status = cli_main(command)
+
+            self.assertEqual(status, 0)
+            self.assertEqual((bin_dir / "codex1").resolve(), target.resolve())
+            self.assertEqual((bin_dir / "codex2").resolve(), target.resolve())
+
+            with store.lock():
+                store.remove(provider, "first@example.com")
+            with contextlib.redirect_stdout(io.StringIO()):
+                status = cli_main(command)
+
+            self.assertEqual(status, 0)
+            self.assertTrue((bin_dir / "codex1").is_symlink())
+            self.assertFalse((bin_dir / "codex2").exists())
+            self.assertFalse((bin_dir / "codex2").is_symlink())
+            self.assertEqual(store.resolve_alias("codex1").profile, "second@example.com")
+
     def test_save_current_infers_email_profile_and_activates_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

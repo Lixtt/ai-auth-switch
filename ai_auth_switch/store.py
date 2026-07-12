@@ -17,6 +17,7 @@ from ai_auth_switch.providers import Provider
 
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._@+-]+")
 RESERVED_NAMES = {"", ".", "..", "tmp", "backup", "current"}
+NUMBERED_CODEX_ALIAS_RE = re.compile(r"^codex([1-9][0-9]*)$")
 
 
 def default_store_dir() -> Path:
@@ -38,6 +39,11 @@ def sanitize_profile_name(name: str) -> str:
     if "/" in clean or "\\" in clean:
         raise AiAuthSwitchError(f"invalid profile name: {name!r}")
     return clean
+
+
+def numbered_codex_alias_index(name: str) -> int | None:
+    match = NUMBERED_CODEX_ALIAS_RE.fullmatch(name)
+    return int(match.group(1)) if match is not None else None
 
 
 def set_private_permissions(path: Path) -> None:
@@ -137,6 +143,9 @@ class AuthStore:
         root.mkdir(parents=True, exist_ok=True)
         set_private_permissions(root)
 
+        if provider.id == "codex":
+            self.sync_numbered_aliases(provider)
+
         active = self.current_profile(provider)
         profiles = []
         for path in sorted(root.glob("*.json")):
@@ -216,6 +225,8 @@ class AuthStore:
         os.replace(tmp, path)
         set_private_permissions(path)
         self.activate(provider, path.stem, backup_existing=False)
+        if provider.id == "codex":
+            self.sync_numbered_aliases(provider)
         return ProfileInfo(name=path.stem, path=path, active=True)
 
     def activate(
@@ -253,7 +264,17 @@ class AuthStore:
         current = self.current_profile(provider)
         if current is not None and current.name == path.stem:
             raise AiAuthSwitchError(f"refusing to remove active profile: {name}")
+
+        aliases = self._read_aliases()
         path.unlink()
+        aliases = {
+            alias_name: alias
+            for alias_name, alias in aliases.items()
+            if not (alias.provider_id == provider.id and alias.profile == path.stem)
+        }
+        self._write_aliases_if_changed(aliases)
+        if provider.id == "codex":
+            self.sync_numbered_aliases(provider)
 
     def rename(self, provider: Provider, old: str, new: str) -> ProfileInfo:
         old_path = self.profile_path(provider, old)
@@ -263,9 +284,26 @@ class AuthStore:
         if new_path.exists():
             raise AiAuthSwitchError(f"profile already exists: {new}")
 
+        aliases = self._read_aliases()
         current = self.current_profile(provider)
         os.replace(old_path, new_path)
         set_private_permissions(new_path)
+        renamed_aliases = {
+            alias_name: (
+                AliasInfo(
+                    name=alias.name,
+                    provider_id=alias.provider_id,
+                    profile=new_path.stem,
+                    command=alias.command,
+                )
+                if alias.provider_id == provider.id and alias.profile == old_path.stem
+                else alias
+            )
+            for alias_name, alias in aliases.items()
+        }
+        self._write_aliases_if_changed(renamed_aliases)
+        if provider.id == "codex":
+            self.sync_numbered_aliases(provider)
         if current is not None and current.name == old_path.stem:
             self.activate(provider, new_path.stem, backup_existing=False)
             return ProfileInfo(name=new_path.stem, path=new_path, active=True)
@@ -273,7 +311,64 @@ class AuthStore:
 
     def list_aliases(self) -> list[AliasInfo]:
         aliases = self._read_aliases()
-        return [aliases[name] for name in sorted(aliases)]
+        return sorted(aliases.values(), key=self._alias_sort_key)
+
+    def sync_numbered_aliases(self, provider: Provider) -> list[AliasInfo]:
+        """Keep codex1, codex2, ... contiguous and aligned with saved profiles."""
+        if provider.id != "codex":
+            return []
+
+        aliases = self._read_aliases()
+        profile_paths = self._profile_paths_in_initial_alias_order(provider)
+        profile_names = {path.stem for path in profile_paths}
+
+        numbered = sorted(
+            (
+                (index, alias)
+                for alias in aliases.values()
+                if (index := numbered_codex_alias_index(alias.name)) is not None
+            ),
+            key=lambda item: item[0],
+        )
+
+        ordered_profiles: list[tuple[str, tuple[str, ...]]] = []
+        assigned_profiles: set[str] = set()
+        for _, alias in numbered:
+            if (
+                alias.provider_id == provider.id
+                and alias.profile in profile_names
+                and alias.profile not in assigned_profiles
+            ):
+                ordered_profiles.append((alias.profile, alias.command))
+                assigned_profiles.add(alias.profile)
+
+        default_command = tuple(str(part) for part in provider.login_command)
+        if not default_command and profile_paths:
+            raise AiAuthSwitchError("automatic Codex alias command cannot be empty")
+        for path in profile_paths:
+            if path.stem not in assigned_profiles:
+                ordered_profiles.append((path.stem, default_command))
+                assigned_profiles.add(path.stem)
+
+        updated = {
+            name: alias
+            for name, alias in aliases.items()
+            if numbered_codex_alias_index(name) is None
+        }
+        automatic: list[AliasInfo] = []
+        for index, (profile, command) in enumerate(ordered_profiles, start=1):
+            name = f"codex{index}"
+            alias = AliasInfo(
+                name=name,
+                provider_id=provider.id,
+                profile=profile,
+                command=command,
+            )
+            updated[name] = alias
+            automatic.append(alias)
+
+        self._write_aliases_if_changed(updated)
+        return automatic
 
     def resolve_alias(self, name: str) -> AliasInfo | None:
         clean = sanitize_profile_name(name)
@@ -313,6 +408,27 @@ class AuthStore:
             raise AiAuthSwitchError(f"alias not found: {name}")
         del aliases[clean]
         self._write_aliases(aliases)
+
+    @staticmethod
+    def _alias_sort_key(alias: AliasInfo) -> tuple[int, int | str]:
+        index = numbered_codex_alias_index(alias.name)
+        if index is not None:
+            return (0, index)
+        return (1, alias.name)
+
+    def _profile_paths_in_initial_alias_order(self, provider: Provider) -> list[Path]:
+        root = self.provider_dir(provider)
+        if not root.exists():
+            return []
+
+        def saved_order(path: Path) -> tuple[int, str]:
+            try:
+                modified_ns = path.stat().st_mtime_ns
+            except OSError:
+                modified_ns = 0
+            return (modified_ns, path.name)
+
+        return sorted(root.glob("*.json"), key=saved_order)
 
     @contextlib.contextmanager
     def activated_temporarily(self, provider: Provider, name: str) -> Iterator[ProfileInfo]:
@@ -457,3 +573,7 @@ class AuthStore:
         set_private_permissions(tmp)
         os.replace(tmp, path)
         set_private_permissions(path)
+
+    def _write_aliases_if_changed(self, aliases: dict[str, AliasInfo]) -> None:
+        if aliases != self._read_aliases():
+            self._write_aliases(aliases)

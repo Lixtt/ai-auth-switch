@@ -128,23 +128,37 @@ previous active auth:
 ai-auth-switch run codex someone@example.com -- codex -C ~/workspace/project
 ```
 
-Create command aliases for frequently used accounts:
+Numbered command aliases are managed automatically for every saved Codex
+account. On the first sync, existing profiles are numbered in saved order;
+later accounts are appended. Removing an account compacts the sequence, and
+renaming an account keeps its number:
 
 ```bash
-ai-auth-switch alias set codex1 codex someone@example.com
-ai-auth-switch alias set codex2 codex other@example.com
-ai-auth-switch alias install codex1
-ai-auth-switch alias install codex2
+ai-auth-switch auth list codex
+#   someone@example.com [codex1]
+#   other@example.com [codex2]
+```
+
+Saving, logging in, renaming, removing, or listing profiles updates the alias
+records. For the default profile store, matching command links are also created
+under `~/.local/bin` and stale links are removed. Run an explicit sync to
+backfill existing accounts or to choose a different command directory:
+
+```bash
+ai-auth-switch alias sync codex
+ai-auth-switch alias sync codex --bin-dir /path/on/PATH
 ```
 
 After installation, `codex1 -C ~/workspace/project` runs the Codex CLI under
-the `someone@example.com` profile and restores the previous active auth when the
-process exits. The default alias command is `codex`; pass a command after `--`
-to customize it:
+the corresponding profile and restores the previous active auth when the
+process exits. Names matching `codex1`, `codex2`, and so on are reserved for
+automatic management. Other alias names can still be created manually with
+`ai-auth-switch alias set` and `ai-auth-switch alias install`.
 
-```bash
-ai-auth-switch alias set codex1 codex someone@example.com -- /path/to/codex
-```
+When `--store-dir` is passed, automatic command-link installation is skipped
+to avoid changing the user's global bin directory. Pass `--bin-dir` to
+`alias sync`, or set `AI_AUTH_SWITCH_ALIAS_BIN_DIR`, to opt into a specific
+directory.
 
 ## Directory Overrides
 
