@@ -39,8 +39,8 @@ This keeps Codex's own configuration layout intact.
 ## Dependent Tool Sync
 
 Some local tools intentionally consume the active Codex auth. After Codex auth
-is saved, logged in, switched, or temporarily activated, `ai-auth-switch`
-syncs those dependent tool states:
+is saved, logged in, or permanently switched, `ai-auth-switch` syncs those
+dependent tool states:
 
 - Hermes is pointed at `openai-codex` and switched to Hermes's
   `openai_runtime=auto` path with a credential-pool entry seeded from the
@@ -91,15 +91,34 @@ ai-auth-switch auth sync codex --no-hermes-restart
 
 ## Wrapper
 
-The wrapper layer temporarily activates a profile, runs a command, and restores
-the previous active auth after the process exits:
+The wrapper layer does not replace the normal active auth. It creates a private
+temporary `CODEX_HOME`, links every existing non-auth entry from the normal
+Codex home into it, and installs the selected profile as that temporary home's
+`auth.json`:
 
 ```bash
 ai-auth-switch run codex person@example.com -- codex -C ~/workspace/project
 ```
 
-This is useful when a user wants a one-off profile without changing the default
-active account for later shells.
+The child process receives the temporary `CODEX_HOME`. It retains an existing
+`CODEX_SQLITE_HOME`, or points SQLite state back to the normal Codex home when
+that variable is unset. Consequently config, history, sessions, skills, logs,
+caches, plugins, and SQLite state remain shared while credentials are isolated.
+
+Codex can refresh OAuth credentials by atomically replacing `auth.json`. The
+wrapper copies that replacement back to the selected saved profile before
+removing the temporary home. A profile-scoped lock is held for the child
+lifetime to protect rotating refresh tokens. Different profiles use different
+locks and therefore run concurrently; processes using the same profile are
+serialized.
+
+Profile command dispatch and other read-only commands only read atomically
+written state and do not take the global auth-management lock. Permanent
+profile mutations still use the global lock, but no profile-scoped Codex
+process holds it for its lifetime.
+
+Dependent Hermes/OpenClaw synchronization remains attached to permanent active
+auth changes. A profile-scoped run does not change those global integrations.
 
 ## Provider Boundary
 

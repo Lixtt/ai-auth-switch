@@ -8,7 +8,9 @@ truth for everything except the active auth file:
 
 - `~/.codex/config.toml` is not rewritten.
 - `~/.codex/history.jsonl`, `sessions/`, `skills/`, and other Codex state stay in place.
-- `auth.json` is the only active Codex file switched.
+- Permanent profile changes switch only `auth.json`.
+- Profile-scoped runs isolate `auth.json` in a temporary `CODEX_HOME` while
+  sharing the normal Codex configuration and state.
 - Saved profiles live outside Codex under `~/.local/share/ai-auth-switch/`.
 - Hermes and OpenClaw Codex-dependent auth state is synchronized after Codex
   auth changes.
@@ -121,8 +123,8 @@ ai-auth-switch auth save codex
 If you run as another Unix user, make sure `CODEX_HOME` points at the Codex
 config directory you actually use, or pass `--codex-home /path/to/.codex`.
 
-Run Codex with a profile for the lifetime of one process, then restore the
-previous active auth:
+Run Codex with isolated auth for the lifetime of one process. The default
+active auth is never changed:
 
 ```bash
 ai-auth-switch run codex someone@example.com -- codex -C ~/workspace/project
@@ -139,7 +141,7 @@ ai-auth-switch auth list codex
 #   other@example.com [codex2]
 ```
 
-Saving, logging in, renaming, removing, or listing profiles updates the alias
+Saving, logging in, switching, renaming, or removing profiles updates the alias
 records. For the default profile store, matching command links are also created
 under `~/.local/bin` and stale links are removed. Run an explicit sync to
 backfill existing accounts or to choose a different command directory:
@@ -150,9 +152,21 @@ ai-auth-switch alias sync codex --bin-dir /path/on/PATH
 ```
 
 After installation, `codex1 -C ~/workspace/project` runs the Codex CLI under
-the corresponding profile and restores the previous active auth when the
-process exits. Names matching `codex1`, `codex2`, and so on are reserved for
-automatic management. Other alias names can still be created manually with
+the corresponding profile without changing the account used by `codex2` or by
+the default `codex` command. Different numbered accounts can run concurrently.
+Runs of the same saved account are serialized because Codex OAuth refresh
+tokens rotate and must not be refreshed independently from two auth copies.
+
+Each run gets a private temporary `CODEX_HOME` containing only its selected
+`auth.json`. Existing entries from the normal Codex home—including
+`config.toml`, `history.jsonl`, `sessions/`, `skills/`, logs, caches, and
+plugins—are linked into that temporary home. An existing `CODEX_SQLITE_HOME`
+is preserved; when it is unset, SQLite state points back to the normal Codex
+home. If Codex refreshes and atomically replaces its isolated `auth.json`, the
+new credentials are written back to that saved profile when the process exits.
+
+Names matching `codex1`, `codex2`, and so on are reserved for automatic
+management. Other alias names can still be created manually with
 `ai-auth-switch alias set` and `ai-auth-switch alias install`.
 
 When `--store-dir` is passed, automatic command-link installation is skipped
@@ -192,8 +206,8 @@ AI_AUTH_SWITCH_HOME=/secure/path ai-auth-switch auth list codex
 
 - Auth management: save, list, activate, rename, remove, and inspect profiles.
 - Dependent sync: point Hermes and OpenClaw at the active Codex CLI auth.
-- Wrapper: run a command under a selected profile without permanently changing
-  the active profile after the command exits.
+- Wrapper: run a command in a profile-scoped Codex home without changing the
+  default active profile or blocking runs of other accounts.
 
 Provider support is intentionally small. A provider only needs to define where
 its active auth file lives, how to infer a profile name, and which login command

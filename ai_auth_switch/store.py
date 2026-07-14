@@ -71,6 +71,7 @@ class FileLock:
 
     def __enter__(self) -> "FileLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        set_private_permissions(self.path.parent)
         self._file = self.path.open("a+")
         set_private_permissions(self.path)
         try:
@@ -137,14 +138,26 @@ class AuthStore:
         self.ensure()
         return FileLock(self.lock_path)
 
+    def profile_lock(self, provider: Provider, name: str) -> FileLock:
+        """Return a lock scoped to one provider profile.
+
+        Profile-scoped locks let commands using different Codex accounts run
+        concurrently while still serializing processes that share a rotating
+        OAuth refresh token.
+        """
+        self.ensure()
+        clean = sanitize_profile_name(name)
+        digest = hashlib.sha256(
+            f"{provider.id}\0{clean}".encode("utf-8")
+        ).hexdigest()
+        path = self.base_dir / "profile-locks" / provider.id / f"{digest}.lock"
+        return FileLock(path)
+
     def list_profiles(self, provider: Provider) -> list[ProfileInfo]:
         self.ensure()
         root = self.provider_dir(provider)
         root.mkdir(parents=True, exist_ok=True)
         set_private_permissions(root)
-
-        if provider.id == "codex":
-            self.sync_numbered_aliases(provider)
 
         active = self.current_profile(provider)
         profiles = []
@@ -514,6 +527,13 @@ class AuthStore:
         set_private_permissions(tmp)
         os.replace(tmp, profile_path)
         set_private_permissions(profile_path)
+
+    def sync_profile_auth(self, provider: Provider, name: str, active: Path) -> None:
+        """Persist an auth file atomically replaced by a profile-scoped run."""
+        self._sync_active_back_to_profile_if_replaced(
+            active,
+            self.profile_path(provider, name),
+        )
 
     def _read_aliases(self) -> dict[str, AliasInfo]:
         path = self.aliases_path()

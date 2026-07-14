@@ -246,32 +246,33 @@ def _sync_after_auth_change(
 def _cmd_auth_list(args: argparse.Namespace) -> int:
     store = _store_from_args(args)
     provider_ids = _provider_ids(args)
-    with store.lock():
-        for index, provider_id in enumerate(provider_ids):
-            provider = _provider_by_id(provider_id, args)
-            profiles = store.list_profiles(provider)
-            automatic_aliases = store.sync_numbered_aliases(provider)
-            _sync_automatic_alias_links(args, automatic_aliases)
-            aliases_by_profile = {
-                alias.profile: alias.name for alias in automatic_aliases
-            }
-            if len(provider_ids) > 1:
-                if index:
-                    print()
-                print(f"{provider.id}:")
-            if not profiles:
-                prefix = "  " if len(provider_ids) > 1 else ""
-                print(f"{prefix}no profiles")
-                print(f"{prefix}{_auth_hint(provider)}")
-                continue
-            for profile in profiles:
-                mark = "*" if profile.active else " "
-                suffix = " (content match)" if profile.by_content else ""
-                alias_name = aliases_by_profile.get(profile.name)
-                if alias_name:
-                    suffix += f" [{alias_name}]"
-                prefix = "  " if len(provider_ids) > 1 else ""
-                print(f"{prefix}{mark} {profile.name}{suffix}")
+    aliases = store.list_aliases()
+    for index, provider_id in enumerate(provider_ids):
+        provider = _provider_by_id(provider_id, args)
+        profiles = store.list_profiles(provider)
+        aliases_by_profile = {
+            alias.profile: alias.name
+            for alias in aliases
+            if alias.provider_id == provider.id
+            and numbered_codex_alias_index(alias.name) is not None
+        }
+        if len(provider_ids) > 1:
+            if index:
+                print()
+            print(f"{provider.id}:")
+        if not profiles:
+            prefix = "  " if len(provider_ids) > 1 else ""
+            print(f"{prefix}no profiles")
+            print(f"{prefix}{_auth_hint(provider)}")
+            continue
+        for profile in profiles:
+            mark = "*" if profile.active else " "
+            suffix = " (content match)" if profile.by_content else ""
+            alias_name = aliases_by_profile.get(profile.name)
+            if alias_name:
+                suffix += f" [{alias_name}]"
+            prefix = "  " if len(provider_ids) > 1 else ""
+            print(f"{prefix}{mark} {profile.name}{suffix}")
     return 0
 
 
@@ -279,20 +280,17 @@ def _cmd_auth_current(args: argparse.Namespace) -> int:
     store = _store_from_args(args)
     provider_ids = _provider_ids(args)
     missing = False
-    with store.lock():
-        for provider_id in provider_ids:
-            provider = _provider_by_id(provider_id, args)
-            automatic_aliases = store.sync_numbered_aliases(provider)
-            _sync_automatic_alias_links(args, automatic_aliases)
-            current = store.current_profile(provider)
-            prefix = f"{provider.id}: " if len(provider_ids) > 1 else ""
-            if current is None:
-                print(f"{prefix}not active")
-                print(f"{prefix}{_auth_hint(provider)}")
-                missing = True
-                continue
-            suffix = " (content match)" if current.by_content else ""
-            print(f"{prefix}{current.name}{suffix}")
+    for provider_id in provider_ids:
+        provider = _provider_by_id(provider_id, args)
+        current = store.current_profile(provider)
+        prefix = f"{provider.id}: " if len(provider_ids) > 1 else ""
+        if current is None:
+            print(f"{prefix}not active")
+            print(f"{prefix}{_auth_hint(provider)}")
+            missing = True
+            continue
+        suffix = " (content match)" if current.by_content else ""
+        print(f"{prefix}{current.name}{suffix}")
     return 1 if missing else 0
 
 
@@ -324,8 +322,7 @@ def _cmd_auth_use(args: argparse.Namespace) -> int:
 def _cmd_auth_sync(args: argparse.Namespace) -> int:
     provider = _provider_from_args(args)
     store = _store_from_args(args)
-    with store.lock():
-        current = store.current_profile(provider)
+    current = store.current_profile(provider)
     results = sync_codex_dependents(
         provider,
         sync_hermes=not args.no_hermes,
@@ -433,19 +430,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if not command:
         command = list(provider.login_command)
 
-    def sync_selected() -> None:
-        _sync_after_auth_change(args, provider, store, profile_name=args.name)
-
-    def sync_current() -> None:
-        _sync_after_auth_change(args, provider, store)
-
     return run_with_profile(
         store,
         provider,
         args.name,
         command,
-        on_activated=sync_selected,
-        on_restored=sync_current,
     )
 
 
@@ -468,11 +457,7 @@ def _run_alias(
 
 def _cmd_alias_list(args: argparse.Namespace) -> int:
     store = _store_from_args(args)
-    provider = _provider_by_id("codex", args)
-    with store.lock():
-        automatic_aliases = store.sync_numbered_aliases(provider)
-        aliases = store.list_aliases()
-        _sync_automatic_alias_links(args, automatic_aliases)
+    aliases = store.list_aliases()
     if not aliases:
         print("no aliases")
         return 0
@@ -529,8 +514,7 @@ def _cmd_alias_sync(args: argparse.Namespace) -> int:
 
 def _cmd_alias_run(args: argparse.Namespace) -> int:
     store = _store_from_args(args)
-    with store.lock():
-        alias = store.resolve_alias(args.name)
+    alias = store.resolve_alias(args.name)
     if alias is None:
         raise AiAuthSwitchError(f"alias not found: {args.name}")
     provider = _provider_by_id(alias.provider_id, args)
@@ -539,8 +523,7 @@ def _cmd_alias_run(args: argparse.Namespace) -> int:
 
 def _cmd_alias_install(args: argparse.Namespace) -> int:
     store = _store_from_args(args)
-    with store.lock():
-        alias = store.resolve_alias(args.name)
+    alias = store.resolve_alias(args.name)
     if alias is None:
         raise AiAuthSwitchError(f"alias not found: {args.name}")
 
@@ -575,8 +558,7 @@ def _maybe_run_program_alias(
         return None
 
     store = AuthStore()
-    with store.lock():
-        alias = store.resolve_alias(alias_name)
+    alias = store.resolve_alias(alias_name)
     if alias is None:
         raise AiAuthSwitchError(
             f"alias not found for executable {alias_name!r}; "
@@ -678,7 +660,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser(
         "run",
-        help="Run a command under a profile, then restore the previous active auth.",
+        help="Run a command with isolated auth while sharing normal Codex state.",
     )
     run.add_argument("provider", choices=SUPPORTED_PROVIDERS)
     run.add_argument("name")

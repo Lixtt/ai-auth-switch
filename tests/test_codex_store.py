@@ -8,6 +8,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -26,6 +27,7 @@ from ai_auth_switch.sync import (
     sync_codex_dependents,
 )
 from ai_auth_switch.cli import main as cli_main
+from ai_auth_switch.wrapper import run_with_profile
 
 
 def fake_jwt(payload: dict) -> str:
@@ -63,6 +65,7 @@ class CodexStoreTests(unittest.TestCase):
 
             with store.lock():
                 listed = store.list_profiles(provider)
+                store.sync_numbered_aliases(provider)
                 aliases = store.list_aliases()
 
             self.assertEqual(
@@ -356,17 +359,22 @@ class CodexStoreTests(unittest.TestCase):
             codex_home.mkdir()
 
             out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                status = cli_main(
-                    [
-                        "--store-dir",
-                        str(store_dir),
-                        "--codex-home",
-                        str(codex_home),
-                        "auth",
-                        "list",
-                    ]
-                )
+            with mock.patch.object(
+                AuthStore,
+                "lock",
+                side_effect=AssertionError("auth list must not take the global lock"),
+            ):
+                with contextlib.redirect_stdout(out):
+                    status = cli_main(
+                        [
+                            "--store-dir",
+                            str(store_dir),
+                            "--codex-home",
+                            str(codex_home),
+                            "auth",
+                            "list",
+                        ]
+                    )
 
             self.assertEqual(status, 0)
             output = out.getvalue()
@@ -385,18 +393,23 @@ class CodexStoreTests(unittest.TestCase):
             )
 
             out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                status = cli_main(
-                    [
-                        "--store-dir",
-                        str(store_dir),
-                        "--codex-home",
-                        str(codex_home),
-                        "auth",
-                        "current",
-                        "codex",
-                    ]
-                )
+            with mock.patch.object(
+                AuthStore,
+                "lock",
+                side_effect=AssertionError("auth current must not take the global lock"),
+            ):
+                with contextlib.redirect_stdout(out):
+                    status = cli_main(
+                        [
+                            "--store-dir",
+                            str(store_dir),
+                            "--codex-home",
+                            str(codex_home),
+                            "auth",
+                            "current",
+                            "codex",
+                        ]
+                    )
 
             self.assertEqual(status, 1)
             output = out.getvalue()
@@ -450,11 +463,17 @@ class CodexStoreTests(unittest.TestCase):
 
             calls = []
 
-            def fake_call(command):
+            def fake_call(command, *, env):
                 calls.append(command)
+                isolated_home = Path(env["CODEX_HOME"])
+                self.assertNotEqual(isolated_home, codex_home)
+                isolated_auth = json.loads(
+                    (isolated_home / "auth.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(isolated_auth["email"], "a@example.com")
                 current = store.current_profile(provider)
                 self.assertIsNotNone(current)
-                self.assertEqual(current.name, "a@example.com")
+                self.assertEqual(current.name, "b@example.com")
                 return 0
 
             with mock.patch("ai_auth_switch.wrapper.subprocess.call", fake_call):
@@ -502,11 +521,17 @@ class CodexStoreTests(unittest.TestCase):
 
             calls = []
 
-            def fake_call(command):
+            def fake_call(command, *, env):
                 calls.append(command)
+                isolated_home = Path(env["CODEX_HOME"])
+                self.assertNotEqual(isolated_home, codex_home)
+                isolated_auth = json.loads(
+                    (isolated_home / "auth.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(isolated_auth["email"], "a@example.com")
                 current = store.current_profile(provider)
                 self.assertIsNotNone(current)
-                self.assertEqual(current.name, "a@example.com")
+                self.assertEqual(current.name, "b@example.com")
                 return 0
 
             with mock.patch.dict(
@@ -517,11 +542,155 @@ class CodexStoreTests(unittest.TestCase):
                 },
             ):
                 with mock.patch("ai_auth_switch.wrapper.subprocess.call", fake_call):
-                    status = cli_main(["-C", "/tmp/workspace"], program_name="codex1")
+                    with mock.patch.object(
+                        AuthStore,
+                        "lock",
+                        side_effect=AssertionError("program aliases must not take the global lock"),
+                    ):
+                        status = cli_main(
+                            ["-C", "/tmp/workspace"],
+                            program_name="codex1",
+                        )
 
             self.assertEqual(status, 0)
             self.assertEqual(calls, [["fake-codex", "-C", "/tmp/workspace"]])
             self.assertEqual(store.current_profile(provider).name, "b@example.com")
+
+    def test_profile_runs_with_different_accounts_concurrently(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text("model = 'test'\n", encoding="utf-8")
+            (codex_home / "sessions").mkdir()
+            sqlite_home = root / "sqlite"
+            sqlite_home.mkdir()
+
+            provider = CodexProvider(
+                codex_home=codex_home,
+                login_command=["fake-codex"],
+            )
+            store = AuthStore(root / "store")
+            for name in ("a@example.com", "b@example.com"):
+                path = store.profile_path(provider, name)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({"email": name}), encoding="utf-8")
+
+            barrier = threading.Barrier(2, timeout=3)
+            seen: dict[str, str] = {}
+            errors: list[BaseException] = []
+
+            def fake_call(command, *, env):
+                isolated_home = Path(env["CODEX_HOME"])
+                auth = json.loads(
+                    (isolated_home / "auth.json").read_text(encoding="utf-8")
+                )
+                seen[command[-1]] = auth["email"]
+                self.assertTrue((isolated_home / "config.toml").is_symlink())
+                self.assertEqual(
+                    (isolated_home / "config.toml").resolve(),
+                    (codex_home / "config.toml").resolve(),
+                )
+                self.assertTrue((isolated_home / "sessions").is_symlink())
+                self.assertEqual(env["CODEX_SQLITE_HOME"], str(sqlite_home))
+                barrier.wait()
+                return 0
+
+            def run(name: str) -> None:
+                try:
+                    status = run_with_profile(
+                        store,
+                        provider,
+                        name,
+                        ["fake-codex", name],
+                    )
+                    self.assertEqual(status, 0)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with mock.patch.dict(
+                os.environ,
+                {"CODEX_SQLITE_HOME": str(sqlite_home)},
+            ):
+                with mock.patch("ai_auth_switch.wrapper.subprocess.call", fake_call):
+                    threads = [
+                        threading.Thread(target=run, args=(name,))
+                        for name in ("a@example.com", "b@example.com")
+                    ]
+                    for thread in threads:
+                        thread.start()
+                    for thread in threads:
+                        thread.join(timeout=5)
+
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+            self.assertEqual(
+                seen,
+                {
+                    "a@example.com": "a@example.com",
+                    "b@example.com": "b@example.com",
+                },
+            )
+
+    def test_isolated_run_syncs_refreshed_auth_and_replaced_shared_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            config = codex_home / "config.toml"
+            config.write_text("model = 'before'\n", encoding="utf-8")
+            active = codex_home / "auth.json"
+            active.write_text(json.dumps({"email": "default@example.com"}), encoding="utf-8")
+
+            provider = CodexProvider(
+                codex_home=codex_home,
+                login_command=["fake-codex"],
+            )
+            store = AuthStore(root / "store")
+            profile = store.profile_path(provider, "selected@example.com")
+            profile.parent.mkdir(parents=True, exist_ok=True)
+            profile.write_text(
+                json.dumps({"email": "selected@example.com"}),
+                encoding="utf-8",
+            )
+
+            def fake_call(command, *, env):
+                isolated_home = Path(env["CODEX_HOME"])
+                self.assertEqual(env["CODEX_SQLITE_HOME"], str(codex_home))
+                isolated_auth = isolated_home / "auth.json"
+                isolated_auth.unlink()
+                isolated_auth.write_text(
+                    json.dumps(
+                        {
+                            "email": "selected@example.com",
+                            "refreshed": True,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                isolated_config = isolated_home / "config.toml"
+                isolated_config.unlink()
+                isolated_config.write_text("model = 'after'\n", encoding="utf-8")
+                return 0
+
+            with mock.patch.dict(os.environ, {"CODEX_SQLITE_HOME": ""}):
+                with mock.patch("ai_auth_switch.wrapper.subprocess.call", fake_call):
+                    status = run_with_profile(
+                        store,
+                        provider,
+                        "selected@example.com",
+                        ["fake-codex"],
+                    )
+
+            self.assertEqual(status, 0)
+            refreshed = json.loads(profile.read_text(encoding="utf-8"))
+            self.assertTrue(refreshed["refreshed"])
+            self.assertEqual(config.read_text(encoding="utf-8"), "model = 'after'\n")
+            self.assertEqual(
+                json.loads(active.read_text(encoding="utf-8"))["email"],
+                "default@example.com",
+            )
 
     def test_cli_alias_install_creates_executable_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1005,6 +1174,7 @@ class CodexStoreTests(unittest.TestCase):
             with mock.patch.dict(
                 os.environ,
                 {
+                    "AI_AUTH_SWITCH_HOME": str(root / "store"),
                     "OPENCLAW_STATE_DIR": str(openclaw),
                     "HERMES_AGENT_DIR": str(root / "missing-hermes"),
                 },
