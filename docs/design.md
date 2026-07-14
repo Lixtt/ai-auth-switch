@@ -117,6 +117,11 @@ written state and do not take the global auth-management lock. Permanent
 profile mutations still use the global lock, but no profile-scoped Codex
 process holds it for its lifetime.
 
+For editable installs, numbered aliases point at the checkout's bundled
+launcher instead of a machine-local `/usr/local/bin` entry point. Existing
+managed links are atomically migrated when their target changes. This matters
+when `~/.local/bin` is shared by multiple workers but `/usr/local` is not.
+
 Dependent Hermes/OpenClaw synchronization remains attached to permanent active
 auth changes. A profile-scoped run does not change those global integrations.
 

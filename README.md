@@ -27,6 +27,16 @@ You can also run without installation:
 ./bin/ai-auth-switch --help
 ```
 
+If the checkout and home directory are shared by multiple machines but
+`/usr/local` is machine-local, install the shared launcher on `PATH` instead:
+
+```bash
+mkdir -p ~/.local/bin
+ln -sfn "$PWD/bin/ai-auth-switch" ~/.local/bin/ai-auth-switch
+hash -r
+ai-auth-switch alias sync codex
+```
+
 ## Codex Usage
 
 Save the currently active Codex login:
@@ -172,7 +182,10 @@ management. Other alias names can still be created manually with
 When `--store-dir` is passed, automatic command-link installation is skipped
 to avoid changing the user's global bin directory. Pass `--bin-dir` to
 `alias sync`, or set `AI_AUTH_SWITCH_ALIAS_BIN_DIR`, to opt into a specific
-directory.
+directory. Editable installs prefer the checkout's shared `bin/ai-auth-switch`
+launcher, which keeps aliases portable when the home directory is mounted on
+multiple machines. Set `AI_AUTH_SWITCH_ALIAS_TARGET` or pass `--target` to
+choose another launcher explicitly.
 
 ## Directory Overrides
 

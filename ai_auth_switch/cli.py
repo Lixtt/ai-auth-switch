@@ -32,11 +32,13 @@ PROGRAM_NAMES = {
     "python3",
 }
 AUTO_ALIAS_BIN_DIR_ENV = "AI_AUTH_SWITCH_ALIAS_BIN_DIR"
+AUTO_ALIAS_TARGET_ENV = "AI_AUTH_SWITCH_ALIAS_TARGET"
 
 
 @dataclass(frozen=True)
 class AliasLinkSyncResult:
     installed: tuple[Path, ...] = ()
+    updated: tuple[Path, ...] = ()
     removed: tuple[Path, ...] = ()
     conflicts: tuple[Path, ...] = ()
 
@@ -70,11 +72,16 @@ def _provider_by_id(provider_id: str, args: argparse.Namespace) -> Provider:
 
 
 def _alias_executable_target(target: str | Path | None = None) -> Path:
-    candidate = (
-        Path(target).expanduser()
-        if target is not None
-        else Path(shutil.which("ai-auth-switch") or sys.argv[0]).expanduser()
-    )
+    configured = os.environ.get(AUTO_ALIAS_TARGET_ENV)
+    checkout_target = Path(__file__).resolve().parents[1] / "bin" / "ai-auth-switch"
+    if target is not None:
+        candidate = Path(target).expanduser()
+    elif configured and configured.strip():
+        candidate = Path(configured).expanduser()
+    elif checkout_target.is_file() and os.access(checkout_target, os.X_OK):
+        candidate = checkout_target
+    else:
+        candidate = Path(shutil.which("ai-auth-switch") or sys.argv[0]).expanduser()
     try:
         resolved = candidate.resolve(strict=True)
     except OSError as exc:
@@ -96,6 +103,26 @@ def _symlink_points_to(link: Path, target: Path) -> bool:
     return raw_target.resolve() == target.resolve()
 
 
+def _is_managed_alias_link(link: Path) -> bool:
+    if not link.is_symlink():
+        return False
+    try:
+        raw_target = Path(os.readlink(link))
+    except OSError:
+        return False
+    return raw_target.name.startswith("ai-auth-switch")
+
+
+def _replace_symlink(link: Path, target: Path) -> None:
+    tmp = link.with_name(f".{link.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    try:
+        os.symlink(target, tmp)
+        os.replace(tmp, link)
+    finally:
+        if tmp.is_symlink():
+            tmp.unlink()
+
+
 def _sync_numbered_alias_executables(
     aliases: Sequence[AliasInfo],
     *,
@@ -114,6 +141,7 @@ def _sync_numbered_alias_executables(
         raise AiAuthSwitchError(f"failed to create alias directory {bin_dir}: {exc}") from exc
 
     installed: list[Path] = []
+    updated: list[Path] = []
     removed: list[Path] = []
     conflicts: list[Path] = []
     for name in sorted(automatic, key=lambda item: numbered_codex_alias_index(item) or 0):
@@ -127,7 +155,16 @@ def _sync_numbered_alias_executables(
                 ) from exc
             installed.append(link)
         elif not _symlink_points_to(link, target):
-            conflicts.append(link)
+            if _is_managed_alias_link(link):
+                try:
+                    _replace_symlink(link, target)
+                except OSError as exc:
+                    raise AiAuthSwitchError(
+                        f"failed to update automatic alias {link}: {exc}"
+                    ) from exc
+                updated.append(link)
+            else:
+                conflicts.append(link)
 
     try:
         candidates = list(bin_dir.iterdir())
@@ -137,7 +174,10 @@ def _sync_numbered_alias_executables(
         if (
             numbered_codex_alias_index(link.name) is not None
             and link.name not in automatic
-            and _symlink_points_to(link, target)
+            and (
+                _symlink_points_to(link, target)
+                or _is_managed_alias_link(link)
+            )
         ):
             try:
                 link.unlink()
@@ -149,6 +189,7 @@ def _sync_numbered_alias_executables(
 
     return AliasLinkSyncResult(
         installed=tuple(installed),
+        updated=tuple(updated),
         removed=tuple(removed),
         conflicts=tuple(conflicts),
     )
@@ -166,6 +207,8 @@ def _automatic_alias_bin_dir(args: argparse.Namespace) -> Path | None:
 def _print_alias_link_sync(result: AliasLinkSyncResult) -> None:
     for link in result.installed:
         print(f"installed automatic alias {link.name} -> {os.readlink(link)}")
+    for link in result.updated:
+        print(f"updated automatic alias {link.name} -> {os.readlink(link)}")
     for link in result.removed:
         print(f"removed stale automatic alias {link.name}")
     for link in result.conflicts:

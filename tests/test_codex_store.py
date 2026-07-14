@@ -204,6 +204,20 @@ class CodexStoreTests(unittest.TestCase):
             self.assertEqual((bin_dir / "codex1").resolve(), target.resolve())
             self.assertEqual((bin_dir / "codex2").resolve(), target.resolve())
 
+            legacy_target = root / "ai-auth-switch-legacy"
+            legacy_target.write_text("#!/bin/sh\n", encoding="utf-8")
+            legacy_target.chmod(0o700)
+            (bin_dir / "codex1").unlink()
+            os.symlink(legacy_target, bin_dir / "codex1")
+
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                status = cli_main(command)
+
+            self.assertEqual(status, 0)
+            self.assertEqual((bin_dir / "codex1").resolve(), target.resolve())
+            self.assertIn("updated automatic alias codex1", out.getvalue())
+
             with store.lock():
                 store.remove(provider, "first@example.com")
             with contextlib.redirect_stdout(io.StringIO()):
