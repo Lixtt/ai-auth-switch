@@ -10,7 +10,7 @@ from pathlib import Path
 
 from ai_auth_switch.errors import AiAuthSwitchError
 from ai_auth_switch.providers import Provider
-from ai_auth_switch.store import AuthStore, set_private_permissions
+from ai_auth_switch.store import AuthStore, set_private_permissions, sha256_file
 
 
 def _is_codex_auth_artifact(name: str) -> bool:
@@ -33,11 +33,10 @@ def _link_shared_codex_state(source_home: Path, isolated_home: Path) -> None:
             continue
         target = isolated_home / source.name
         try:
-            os.symlink(
-                source.absolute(),
-                target,
-                target_is_directory=source.is_dir(),
-            )
+            # On the supported POSIX hosts a symlink does not need the target
+            # type. Avoiding source.is_dir() saves one shared-filesystem stat
+            # per Codex state entry on every launch.
+            os.symlink(source.absolute(), target)
         except OSError as exc:
             raise AiAuthSwitchError(
                 f"failed to share Codex state {source} in isolated home: {exc}"
@@ -72,6 +71,49 @@ def _sync_replaced_shared_files(source_home: Path, isolated_home: Path) -> None:
                 shutil.copytree(isolated, shared)
 
 
+def _codex_runtime_parent() -> Path:
+    """Return a machine-local parent for private Codex homes.
+
+    Codex refuses to install helper binaries when CODEX_HOME is below the
+    system temporary directory, so prefer the per-user runtime directory and
+    fall back to /var/tmp. Both stay local to a worker in the target cluster.
+    """
+    configured = os.environ.get("AI_AUTH_SWITCH_RUNTIME_DIR", "").strip()
+    managed_parent = not configured
+    if configured:
+        parent = Path(configured).expanduser()
+    else:
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+        if not runtime_dir:
+            candidate = Path("/run/user") / str(os.geteuid())
+            if candidate.is_dir() and os.access(candidate, os.W_OK):
+                runtime_dir = str(candidate)
+        parent = (
+            Path(runtime_dir) / "ai-auth-switch" / "codex"
+            if runtime_dir
+            else Path("/var/tmp") / f"ai-auth-switch-{os.geteuid()}" / "codex"
+        )
+
+    try:
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as exc:
+        raise AiAuthSwitchError(
+            f"failed to create runtime directory {parent}: {exc}"
+        ) from exc
+    if not parent.is_dir():
+        raise AiAuthSwitchError(f"runtime path is not a directory: {parent}")
+    if managed_parent:
+        try:
+            if parent.is_symlink() or parent.stat().st_uid != os.geteuid():
+                raise AiAuthSwitchError(f"unsafe runtime directory: {parent}")
+            parent.chmod(0o700)
+        except OSError as exc:
+            raise AiAuthSwitchError(
+                f"failed to secure runtime directory {parent}: {exc}"
+            ) from exc
+    return parent
+
+
 def _run_codex_with_profile(
     store: AuthStore,
     provider: Provider,
@@ -80,39 +122,54 @@ def _run_codex_with_profile(
 ) -> int:
     source_home = provider.active_auth_path.parent
     profile_path = store.profile_path(provider, profile)
-    runtime_root = store.base_dir / "runtime" / provider.id
+    with tempfile.TemporaryDirectory(
+        prefix="ai-auth-switch-codex-",
+        dir=_codex_runtime_parent(),
+    ) as tmp:
+        isolated_home = Path(tmp)
+        set_private_permissions(isolated_home)
+        _link_shared_codex_state(source_home, isolated_home)
 
-    with store.profile_lock(provider, profile):
-        if not profile_path.exists():
-            raise AiAuthSwitchError(f"profile not found: {profile}")
+        isolated_auth = isolated_home / "auth.json"
+        # Same-account runs deliberately reference one profile file so each
+        # Codex process can observe a token rotated by another process. The
+        # private home still keeps different accounts on different auth paths.
+        # Only installation and reconciliation are serialized; the Codex
+        # process itself remains fully concurrent.
+        with store.profile_lock(provider, profile):
+            if not profile_path.exists():
+                raise AiAuthSwitchError(f"profile not found: {profile}")
 
-        runtime_root.mkdir(parents=True, exist_ok=True)
-        set_private_permissions(runtime_root)
-        with tempfile.TemporaryDirectory(
-            prefix="session-",
-            dir=runtime_root,
-        ) as tmp:
-            isolated_home = Path(tmp)
-            set_private_permissions(isolated_home)
-            _link_shared_codex_state(source_home, isolated_home)
-
-            isolated_auth = isolated_home / "auth.json"
             try:
                 os.symlink(profile_path.absolute(), isolated_auth)
             except OSError as exc:
                 raise AiAuthSwitchError(
                     f"failed to install isolated Codex auth for {profile}: {exc}"
                 ) from exc
+            initial_auth_digest = sha256_file(isolated_auth)
+            expected_identity = provider.auth_identity(isolated_auth)
 
-            env = os.environ.copy()
-            env["CODEX_HOME"] = str(isolated_home)
-            if not env.get("CODEX_SQLITE_HOME", "").strip():
-                env["CODEX_SQLITE_HOME"] = str(source_home)
+        env = os.environ.copy()
+        env["CODEX_HOME"] = str(isolated_home)
+        if not env.get("CODEX_SQLITE_HOME", "").strip():
+            env["CODEX_SQLITE_HOME"] = str(source_home)
 
+        try:
+            return subprocess.call(list(command), env=env)
+        finally:
+            # Codex may atomically replace auth.json and thereby detach this
+            # session from the shared profile. Serialize only the resulting
+            # guarded write-back, not the child process lifetime.
             try:
-                return subprocess.call(list(command), env=env)
+                with store.profile_lock(provider, profile):
+                    store.sync_profile_auth(
+                        provider,
+                        profile,
+                        isolated_auth,
+                        expected_identity=expected_identity,
+                        initial_digest=initial_auth_digest,
+                    )
             finally:
-                store.sync_profile_auth(provider, profile, isolated_auth)
                 _sync_replaced_shared_files(source_home, isolated_home)
 
 

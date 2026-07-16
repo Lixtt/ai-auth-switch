@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from ai_auth_switch.errors import AiAuthSwitchError
 from ai_auth_switch.providers.codex import CodexProvider
 from ai_auth_switch.store import AuthStore
 from ai_auth_switch.sync import (
@@ -395,6 +396,43 @@ class CodexStoreTests(unittest.TestCase):
             self.assertIn("no profiles", output)
             self.assertIn(f"auth file not found at {codex_home / 'auth.json'}", output)
 
+    def test_cli_list_shows_actual_identity_when_profile_contents_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            store_dir = root / "store"
+            codex_home.mkdir()
+            provider = CodexProvider(codex_home=codex_home)
+            store = AuthStore(store_dir)
+            profile = store.profile_path(provider, "expected@example.com")
+            profile.parent.mkdir(parents=True)
+            profile.write_text(
+                json.dumps({"email": "actual@example.com"}),
+                encoding="utf-8",
+            )
+            with store.lock():
+                store.sync_numbered_aliases(provider)
+
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                status = cli_main(
+                    [
+                        "--store-dir",
+                        str(store_dir),
+                        "--codex-home",
+                        str(codex_home),
+                        "auth",
+                        "list",
+                        "codex",
+                    ]
+                )
+
+            self.assertEqual(status, 0)
+            self.assertIn(
+                "expected@example.com [codex1] (actual auth: actual@example.com)",
+                out.getvalue(),
+            )
+
     def test_cli_current_reports_unmanaged_auth(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -644,6 +682,190 @@ class CodexStoreTests(unittest.TestCase):
                     "a@example.com": "a@example.com",
                     "b@example.com": "b@example.com",
                 },
+            )
+
+    def test_profile_runs_with_same_account_concurrently_and_syncs_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text(
+                "model = 'test'\n",
+                encoding="utf-8",
+            )
+
+            provider = CodexProvider(
+                codex_home=codex_home,
+                login_command=["fake-codex"],
+            )
+            store = AuthStore(root / "store")
+            profile = store.profile_path(provider, "same@example.com")
+            profile.parent.mkdir(parents=True, exist_ok=True)
+            profile.write_text(
+                json.dumps({"email": "same@example.com"}),
+                encoding="utf-8",
+            )
+
+            update_lock = store.profile_lock(provider, "same@example.com")
+            self.assertIn("profile-update-locks", update_lock.path.parts)
+            self.assertNotIn("profile-locks", update_lock.path.parts)
+
+            entered = threading.Barrier(2, timeout=3)
+            refreshed = threading.Barrier(2, timeout=3)
+            isolated_homes: set[Path] = set()
+            errors: list[BaseException] = []
+            runtime_base = root / "run"
+            runtime_parent = runtime_base / "ai-auth-switch" / "codex"
+
+            def fake_call(command, *, env):
+                isolated_home = Path(env["CODEX_HOME"])
+                isolated_homes.add(isolated_home)
+                self.assertEqual(isolated_home.parent, runtime_parent)
+                isolated_auth = isolated_home / "auth.json"
+                self.assertTrue(isolated_auth.is_symlink())
+                self.assertEqual(isolated_auth.resolve(), profile.resolve())
+                self.assertEqual(
+                    json.loads(isolated_auth.read_text(encoding="utf-8"))["email"],
+                    "same@example.com",
+                )
+
+                entered.wait()
+                if command[-1] == "refresh":
+                    isolated_auth.unlink()
+                    isolated_auth.write_text(
+                        json.dumps(
+                            {
+                                "email": "same@example.com",
+                                "refreshed": True,
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                refreshed.wait()
+                return 0
+
+            def run(label: str) -> None:
+                try:
+                    status = run_with_profile(
+                        store,
+                        provider,
+                        "same@example.com",
+                        ["fake-codex", label],
+                    )
+                    self.assertEqual(status, 0)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "AI_AUTH_SWITCH_RUNTIME_DIR": "",
+                    "XDG_RUNTIME_DIR": str(runtime_base),
+                },
+            ):
+                with mock.patch("ai_auth_switch.wrapper.subprocess.call", fake_call):
+                    threads = [
+                        threading.Thread(target=run, args=(label,))
+                        for label in ("keep", "refresh")
+                    ]
+                    for thread in threads:
+                        thread.start()
+                    for thread in threads:
+                        thread.join(timeout=5)
+
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+            self.assertEqual(len(isolated_homes), 2)
+            self.assertTrue(
+                json.loads(profile.read_text(encoding="utf-8"))["refreshed"]
+            )
+
+    def test_profile_run_rejects_cross_account_auth_writeback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            provider = CodexProvider(
+                codex_home=codex_home,
+                login_command=["fake-codex"],
+            )
+            store = AuthStore(root / "store")
+            profile = store.profile_path(provider, "selected@example.com")
+            profile.parent.mkdir(parents=True)
+            profile.write_text(
+                json.dumps({"email": "selected@example.com"}),
+                encoding="utf-8",
+            )
+
+            def fake_call(command, *, env):
+                isolated_auth = Path(env["CODEX_HOME"]) / "auth.json"
+                isolated_auth.unlink()
+                isolated_auth.write_text(
+                    json.dumps({"email": "other@example.com"}),
+                    encoding="utf-8",
+                )
+                return 0
+
+            with mock.patch("ai_auth_switch.wrapper.subprocess.call", fake_call):
+                with self.assertRaisesRegex(
+                    AiAuthSwitchError,
+                    "refusing to overwrite profile.*auth identity changed",
+                ):
+                    run_with_profile(
+                        store,
+                        provider,
+                        "selected@example.com",
+                        ["fake-codex"],
+                    )
+
+            self.assertEqual(
+                json.loads(profile.read_text(encoding="utf-8"))["email"],
+                "selected@example.com",
+            )
+            rejected = list((store.backups_dir(provider) / "rejected").glob("*.json"))
+            self.assertEqual(len(rejected), 1)
+            self.assertEqual(
+                json.loads(rejected[0].read_text(encoding="utf-8"))["email"],
+                "other@example.com",
+            )
+
+    def test_writeback_rejects_session_identity_after_profile_is_repaired(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(codex_home=root / ".codex")
+            store = AuthStore(root / "store")
+            profile = store.profile_path(provider, "selected@example.com")
+            profile.parent.mkdir(parents=True)
+            profile.write_text(
+                json.dumps({"email": "repaired@example.com"}),
+                encoding="utf-8",
+            )
+            candidate = root / "candidate.json"
+            candidate.write_text(
+                json.dumps(
+                    {
+                        "email": "old-session@example.com",
+                        "refreshed": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                AiAuthSwitchError,
+                "refusing to overwrite profile",
+            ):
+                store.sync_profile_auth(
+                    provider,
+                    "selected@example.com",
+                    candidate,
+                    expected_identity="email:old-session@example.com",
+                    initial_digest="different",
+                )
+
+            self.assertEqual(
+                json.loads(profile.read_text(encoding="utf-8"))["email"],
+                "repaired@example.com",
             )
 
     def test_isolated_run_syncs_refreshed_auth_and_replaced_shared_config(self) -> None:

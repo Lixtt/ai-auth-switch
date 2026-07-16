@@ -314,6 +314,12 @@ def _cmd_auth_list(args: argparse.Namespace) -> int:
             alias_name = aliases_by_profile.get(profile.name)
             if alias_name:
                 suffix += f" [{alias_name}]"
+            actual_name = provider.infer_profile_name(profile.path)
+            if (
+                actual_name
+                and actual_name.casefold() != profile.name.casefold()
+            ):
+                suffix += f" (actual auth: {actual_name})"
             prefix = "  " if len(provider_ids) > 1 else ""
             print(f"{prefix}{mark} {profile.name}{suffix}")
     return 0

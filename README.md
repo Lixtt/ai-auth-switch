@@ -151,6 +151,11 @@ ai-auth-switch auth list codex
 #   other@example.com [codex2]
 ```
 
+The profile name is normally the authenticated email. If a credential file's
+actual account differs, `auth list` shows it explicitly as
+`(actual auth: ...)` instead of silently presenting a misleading `codexN`
+mapping.
+
 Saving, logging in, switching, renaming, or removing profiles updates the alias
 records. For the default profile store, matching command links are also created
 under `~/.local/bin` and stale links are removed. Run an explicit sync to
@@ -163,9 +168,10 @@ ai-auth-switch alias sync codex --bin-dir /path/on/PATH
 
 After installation, `codex1 -C ~/workspace/project` runs the Codex CLI under
 the corresponding profile without changing the account used by `codex2` or by
-the default `codex` command. Different numbered accounts can run concurrently.
-Runs of the same saved account are serialized because Codex OAuth refresh
-tokens rotate and must not be refreshed independently from two auth copies.
+the default `codex` command. Numbered aliases can run concurrently, including
+multiple processes using the same saved account. A per-profile lock is held
+only for the wrapper's short credential installation and reconciliation
+steps, not for the lifetime of the Codex process.
 
 Each run gets a private temporary `CODEX_HOME` containing only its selected
 `auth.json`. Existing entries from the normal Codex home—including
@@ -174,6 +180,18 @@ plugins—are linked into that temporary home. An existing `CODEX_SQLITE_HOME`
 is preserved; when it is unset, SQLite state points back to the normal Codex
 home. If Codex refreshes and atomically replaces its isolated `auth.json`, the
 new credentials are written back to that saved profile when the process exits.
+Same-account processes reference the same saved profile file so they can
+observe a refresh-token rotation performed by another Codex process. If Codex
+atomically replaces a session's auth symlink, wrapper-side reconciliation back
+to the profile is serialized, skips unchanged stale credentials, and refuses a
+write-back whose actual account differs from the saved profile. Rejected
+credentials are preserved under the profile store's `backups/codex/rejected/`
+directory for inspection.
+
+Temporary homes use the machine-local per-user runtime directory by default
+(`XDG_RUNTIME_DIR`, with a `/var/tmp` fallback), so workers sharing the profile
+store do not contend on `/mnt` for per-process symlink creation and cleanup.
+Set `AI_AUTH_SWITCH_RUNTIME_DIR` to override the runtime parent when needed.
 
 Names matching `codex1`, `codex2`, and so on are reserved for automatic
 management. Other alias names can still be created manually with

@@ -93,7 +93,7 @@ ai-auth-switch auth sync codex --no-hermes-restart
 
 The wrapper layer does not replace the normal active auth. It creates a private
 temporary `CODEX_HOME`, links every existing non-auth entry from the normal
-Codex home into it, and installs the selected profile as that temporary home's
+Codex home into it, and links the selected profile as that temporary home's
 `auth.json`:
 
 ```bash
@@ -104,13 +104,25 @@ The child process receives the temporary `CODEX_HOME`. It retains an existing
 `CODEX_SQLITE_HOME`, or points SQLite state back to the normal Codex home when
 that variable is unset. Consequently config, history, sessions, skills, logs,
 caches, plugins, and SQLite state remain shared while credentials are isolated.
+The temporary home itself uses the machine-local per-user runtime directory by
+default (`XDG_RUNTIME_DIR`, with a `/var/tmp` fallback);
+`AI_AUTH_SWITCH_RUNTIME_DIR` can select a different parent. This keeps
+per-process symlink creation and cleanup off a cross-worker shared filesystem
+without placing `CODEX_HOME` below the system temporary directory, where Codex
+refuses to install helper binaries.
 
 Codex can refresh OAuth credentials by atomically replacing `auth.json`. The
 wrapper copies that replacement back to the selected saved profile before
-removing the temporary home. A profile-scoped lock is held for the child
-lifetime to protect rotating refresh tokens. Different profiles use different
-locks and therefore run concurrently; processes using the same profile are
-serialized.
+removing the temporary home. A profile-scoped lock protects only wrapper-side
+credential installation and reconciliation. It is released while the child
+runs, so processes using either the same or different profiles can run
+concurrently. Each session has a private home but same-account sessions link to
+the same saved credential file, preventing them from blocking one another while
+keeping their rotating credential state shared. If Codex atomically replaces a
+session's auth symlink,
+reconciliation skips an unchanged stale credential and requires the provider
+identity to still match the destination profile. A mismatched candidate is
+preserved under `backups/<provider>/rejected/` and the overwrite is refused.
 
 Profile command dispatch and other read-only commands only read atomically
 written state and do not take the global auth-management lock. Permanent

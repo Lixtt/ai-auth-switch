@@ -139,18 +139,27 @@ class AuthStore:
         return FileLock(self.lock_path)
 
     def profile_lock(self, provider: Provider, name: str) -> FileLock:
-        """Return a lock scoped to one provider profile.
+        """Return a lock for short credential updates to one profile.
 
-        Profile-scoped locks let commands using different Codex accounts run
-        concurrently while still serializing processes that share a rotating
-        OAuth refresh token.
+        Codex wrappers use this only while installing or reconciling auth
+        state. The lock is deliberately not held while the child runs, so
+        multiple processes can use either the same or different accounts.
         """
         self.ensure()
         clean = sanitize_profile_name(name)
         digest = hashlib.sha256(
             f"{provider.id}\0{clean}".encode("utf-8")
         ).hexdigest()
-        path = self.base_dir / "profile-locks" / provider.id / f"{digest}.lock"
+        # Keep short update locks separate from the legacy lifetime-lock
+        # namespace. Already-running wrappers from an older release may still
+        # hold those old locks until their Codex child exits; reusing them would
+        # defeat same-account concurrency during a live upgrade.
+        path = (
+            self.base_dir
+            / "profile-update-locks"
+            / provider.id
+            / f"{digest}.lock"
+        )
         return FileLock(path)
 
     def list_profiles(self, provider: Provider) -> list[ProfileInfo]:
@@ -528,12 +537,90 @@ class AuthStore:
         os.replace(tmp, profile_path)
         set_private_permissions(profile_path)
 
-    def sync_profile_auth(self, provider: Provider, name: str, active: Path) -> None:
-        """Persist an auth file atomically replaced by a profile-scoped run."""
-        self._sync_active_back_to_profile_if_replaced(
-            active,
-            self.profile_path(provider, name),
+    def _preserve_rejected_profile_auth(
+        self,
+        provider: Provider,
+        name: str,
+        active: Path,
+    ) -> Path:
+        backup_root = self.backups_dir(provider) / "rejected"
+        backup_root.mkdir(parents=True, exist_ok=True)
+        set_private_permissions(backup_root)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = backup_root / (
+            f"{sanitize_profile_name(name)}-{stamp}-{time.time_ns()}.json"
         )
+        shutil.copyfile(active, backup, follow_symlinks=True)
+        set_private_permissions(backup)
+        return backup
+
+    def sync_profile_auth(
+        self,
+        provider: Provider,
+        name: str,
+        active: Path,
+        *,
+        expected_identity: str | None = None,
+        initial_digest: str | None = None,
+    ) -> None:
+        """Reconcile profile-scoped auth state without crossing accounts."""
+        if not active.exists():
+            return
+
+        profile_path = self.profile_path(provider, name)
+        try:
+            candidate_digest = sha256_file(active)
+        except OSError:
+            return
+
+        # An unchanged detached credential must never replace a profile that a
+        # concurrent process refreshed while this process was running.
+        if initial_digest is not None and candidate_digest == initial_digest:
+            return
+
+        current_digest: str | None = None
+        if profile_path.exists():
+            try:
+                current_digest = sha256_file(profile_path)
+            except OSError:
+                current_digest = None
+        if current_digest == candidate_digest:
+            return
+
+        try:
+            candidate_identity = provider.auth_identity(active)
+        except OSError:
+            candidate_identity = None
+        try:
+            current_identity = (
+                provider.auth_identity(profile_path) if profile_path.exists() else None
+            )
+        except OSError:
+            current_identity = None
+
+        required_identities = {
+            identity
+            for identity in (expected_identity, current_identity)
+            if identity is not None
+        }
+        if required_identities and (
+            candidate_identity is None
+            or any(candidate_identity != identity for identity in required_identities)
+        ):
+            rejected = self._preserve_rejected_profile_auth(
+                provider,
+                name,
+                active,
+            )
+            found = candidate_identity or "unknown"
+            expected = ", ".join(sorted(required_identities))
+            raise AiAuthSwitchError(
+                f"refusing to overwrite profile {name!r}: auth identity changed "
+                f"(expected [{expected}], candidate {found!r}); preserved candidate "
+                f"at {rejected}"
+            )
+
+        self._sync_active_back_to_profile_if_replaced(active, profile_path)
 
     def _read_aliases(self) -> dict[str, AliasInfo]:
         path = self.aliases_path()
