@@ -21,11 +21,17 @@ truth for everything except the active auth file:
 python -m pip install -e .
 ```
 
+Python 3.10 or newer is required.
+
 You can also run without installation:
 
 ```bash
 ./bin/ai-auth-switch --help
+./bin/ais --help
 ```
+
+`ais` is the short command name for `ai-auth-switch`; both accept exactly the
+same arguments. Examples below use the long name for clarity.
 
 If the checkout and home directory are shared by multiple machines but
 `/usr/local` is machine-local, install the shared launcher on `PATH` instead:
@@ -66,8 +72,35 @@ List and switch profiles:
 ```bash
 ai-auth-switch auth list
 ai-auth-switch auth list codex
+ai-auth-switch auth list codex --usage
 ai-auth-switch auth use codex someone@example.com
 ai-auth-switch auth current codex
+```
+
+Add `--usage` to query every saved Codex account's current rate-limit windows
+in parallel. Each request uses that profile's own access token and explicit
+ChatGPT account ID, so limits cannot be accidentally attributed to another
+saved account. The normal list remains local and instant; usage lookup is
+opt-in because it requires network access and may report an expired login.
+
+```text
+* someone@example.com [codex1] (plus, 5h 72% left, 168h 41% left)
+  other@example.com [codex2] (team, 5h 18% left, 168h 83% left)
+```
+
+Results are cached for 60 seconds. Use `--refresh-usage` to bypass the cache,
+`--usage-cache-ttl` to tune it, `--usage-timeout` for slow networks, and
+`--usage-workers` to limit concurrency. A failure for one account is shown
+inline without hiding results for the other accounts. The command deliberately
+does not refresh expired OAuth tokens; run that profile through Codex or log in
+again so rotating credentials remain coordinated safely.
+
+For status bars, monitoring, or account schedulers, add `--json`. The JSON
+contains profile identity, active/alias state, and structured usage windows
+when `--usage` is also present:
+
+```bash
+ai-auth-switch auth list codex --usage --json
 ```
 
 After Codex auth is saved, logged in, or switched, `ai-auth-switch` also syncs

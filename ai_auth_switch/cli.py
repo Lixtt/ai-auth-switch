@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import difflib
+import json
 import os
 import shutil
 import subprocess
@@ -19,12 +21,14 @@ from ai_auth_switch.store import (
     numbered_codex_alias_index,
 )
 from ai_auth_switch.sync import SyncResult, sync_codex_dependents
+from ai_auth_switch.usage import fetch_profile_usage, format_usage, usage_to_dict
 from ai_auth_switch.wrapper import run_with_profile
 
 
 SUPPORTED_PROVIDERS = ["codex"]
 PROGRAM_NAMES = {
     "ai-auth-switch",
+    "ais",
     "ai-auth-switch.py",
     "cli.py",
     "__main__.py",
@@ -33,6 +37,43 @@ PROGRAM_NAMES = {
 }
 AUTO_ALIAS_BIN_DIR_ENV = "AI_AUTH_SWITCH_ALIAS_BIN_DIR"
 AUTO_ALIAS_TARGET_ENV = "AI_AUTH_SWITCH_ALIAS_TARGET"
+
+
+class CliUsageError(Exception):
+    pass
+
+
+class HelpfulArgumentParser(argparse.ArgumentParser):
+    """Argument parser that shows actionable, command-local help on errors."""
+
+    def _check_value(self, action, value):
+        if action.choices is not None and value not in action.choices:
+            choices = [str(choice) for choice in action.choices or ()]
+            matches = difflib.get_close_matches(str(value), choices, n=1, cutoff=0.55)
+            message = f"invalid choice: {value!r} (choose from {', '.join(choices)})"
+            if matches:
+                message += f"\nDid you mean {matches[0]!r}?"
+            self.error(message)
+        return super()._check_value(action, value)
+
+    def error(self, message: str) -> None:
+        self.print_help(sys.stderr)
+        self._print_message(f"\nerror: {message}\n", sys.stderr)
+        raise CliUsageError(message)
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
 
 
 @dataclass(frozen=True)
@@ -290,9 +331,22 @@ def _cmd_auth_list(args: argparse.Namespace) -> int:
     store = _store_from_args(args)
     provider_ids = _provider_ids(args)
     aliases = store.list_aliases()
+    json_providers = {}
     for index, provider_id in enumerate(provider_ids):
         provider = _provider_by_id(provider_id, args)
         profiles = store.list_profiles(provider)
+        usages = (
+            fetch_profile_usage(
+                ((profile.name, profile.path) for profile in profiles),
+                timeout=args.usage_timeout,
+                workers=args.usage_workers,
+                cache_dir=store.base_dir / "cache" / "usage" / provider.id,
+                cache_ttl=args.usage_cache_ttl,
+                refresh=args.refresh_usage,
+            )
+            if args.usage and provider.id == "codex"
+            else {}
+        )
         aliases_by_profile = {
             alias.profile: alias.name
             for alias in aliases
@@ -300,10 +354,14 @@ def _cmd_auth_list(args: argparse.Namespace) -> int:
             and numbered_codex_alias_index(alias.name) is not None
         }
         if len(provider_ids) > 1:
-            if index:
+            if index and not args.json:
                 print()
-            print(f"{provider.id}:")
+            if not args.json:
+                print(f"{provider.id}:")
         if not profiles:
+            if args.json:
+                json_providers[provider.id] = []
+                continue
             prefix = "  " if len(provider_ids) > 1 else ""
             print(f"{prefix}no profiles")
             print(f"{prefix}{_auth_hint(provider)}")
@@ -314,14 +372,31 @@ def _cmd_auth_list(args: argparse.Namespace) -> int:
             alias_name = aliases_by_profile.get(profile.name)
             if alias_name:
                 suffix += f" [{alias_name}]"
+            usage = usages.get(profile.name)
+            if usage is not None:
+                suffix += f" ({format_usage(usage)})"
             actual_name = provider.infer_profile_name(profile.path)
             if (
                 actual_name
                 and actual_name.casefold() != profile.name.casefold()
             ):
                 suffix += f" (actual auth: {actual_name})"
+            if args.json:
+                entry = {
+                    "name": profile.name,
+                    "active": profile.active,
+                    "content_match": profile.by_content,
+                    "alias": alias_name,
+                    "actual_auth": actual_name,
+                }
+                if usage is not None:
+                    entry["usage"] = usage_to_dict(usage)
+                json_providers.setdefault(provider.id, []).append(entry)
+                continue
             prefix = "  " if len(provider_ids) > 1 else ""
             print(f"{prefix}{mark} {profile.name}{suffix}")
+    if args.json:
+        print(json.dumps({"providers": json_providers}, indent=2, sort_keys=True))
     return 0
 
 
@@ -616,9 +691,9 @@ def _maybe_run_program_alias(
     return _run_alias(store, alias, argv)
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="ai-auth-switch",
+def build_parser(*, prog: str = "ai-auth-switch") -> argparse.ArgumentParser:
+    parser = HelpfulArgumentParser(
+        prog=prog,
         description="Switch auth profiles for AI coding agents.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -643,6 +718,42 @@ def build_parser() -> argparse.ArgumentParser:
 
     auth_list = auth_sub.add_parser("list", help="List profiles.")
     auth_list.add_argument("provider", nargs="?", choices=SUPPORTED_PROVIDERS)
+    auth_list.add_argument(
+        "--usage",
+        action="store_true",
+        help="Fetch current Codex limits for every saved account.",
+    )
+    auth_list.add_argument(
+        "--usage-timeout",
+        type=_positive_float,
+        default=5.0,
+        metavar="SECONDS",
+        help="Per-account usage request timeout (default: 5).",
+    )
+    auth_list.add_argument(
+        "--usage-workers",
+        type=_positive_int,
+        default=4,
+        metavar="COUNT",
+        help="Maximum concurrent usage requests (default: 4).",
+    )
+    auth_list.add_argument(
+        "--usage-cache-ttl",
+        type=_positive_float,
+        default=60.0,
+        metavar="SECONDS",
+        help="Reuse usage results for this long (default: 60).",
+    )
+    auth_list.add_argument(
+        "--refresh-usage",
+        action="store_true",
+        help="Ignore cached usage results.",
+    )
+    auth_list.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit stable machine-readable JSON.",
+    )
     auth_list.set_defaults(func=_cmd_auth_list)
 
     auth_current = auth_sub.add_parser("current", help="Show active profile.")
@@ -769,7 +880,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None, *, program_name: str | None = None) -> int:
-    parser = build_parser()
+    invoked_as = Path(program_name or sys.argv[0]).name
+    parser = build_parser(prog="ais" if invoked_as == "ais" else "ai-auth-switch")
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     try:
         if program_name is not None or argv is None:
@@ -784,6 +896,8 @@ def main(argv: Sequence[str] | None = None, *, program_name: str | None = None) 
         return int(args.func(args))
     except AiAuthSwitchError as exc:
         print(f"ai-auth-switch: {exc}", file=sys.stderr)
+        return 2
+    except CliUsageError:
         return 2
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
