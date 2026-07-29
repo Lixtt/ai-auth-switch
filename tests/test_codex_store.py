@@ -76,17 +76,18 @@ class CodexStoreTests(unittest.TestCase):
                     "z-last-alphabetically@example.com",
                 ],
             )
+            # Newest file first → codex1 (mtime 2e9 > 1e9).
             self.assertEqual(
                 [(alias.name, alias.profile, alias.command) for alias in aliases],
                 [
                     (
                         "codex1",
-                        "z-last-alphabetically@example.com",
+                        "a-first-alphabetically@example.com",
                         ("fake-codex",),
                     ),
                     (
                         "codex2",
-                        "a-first-alphabetically@example.com",
+                        "z-last-alphabetically@example.com",
                         ("fake-codex",),
                     ),
                 ],
@@ -103,18 +104,27 @@ class CodexStoreTests(unittest.TestCase):
             )
             store = AuthStore(root / "store")
 
-            for name in ("z@example.com", "a@example.com", "m@example.com"):
+            # Save with explicit mtimes so newest-first ordering is deterministic.
+            for mtime_ns, name in enumerate(
+                ("z@example.com", "a@example.com", "m@example.com"), start=1
+            ):
                 active = codex_home / "auth.json"
                 if active.exists() or active.is_symlink():
                     active.unlink()
                 active.write_text(json.dumps({"email": name}), encoding="utf-8")
                 with store.lock():
                     store.save_current(provider, name)
+                os.utime(
+                    store.profile_path(provider, name),
+                    ns=(mtime_ns, mtime_ns),
+                )
 
             with store.lock():
+                store.sync_numbered_aliases(provider)
+                # Newest-first: m (mtime 3), a (mtime 2), z (mtime 1).
                 self.assertEqual(
                     [alias.profile for alias in store.list_aliases()],
-                    ["z@example.com", "a@example.com", "m@example.com"],
+                    ["m@example.com", "a@example.com", "z@example.com"],
                 )
                 store.set_alias(
                     provider,
@@ -126,11 +136,12 @@ class CodexStoreTests(unittest.TestCase):
                 store.remove(provider, "a@example.com")
                 aliases = store.list_aliases()
 
+            # After removing a: newest m → codex1, z → codex2.
             self.assertEqual(
                 [(alias.name, alias.profile, alias.command) for alias in aliases],
                 [
-                    ("codex1", "z@example.com", ("fake-codex",)),
-                    ("codex2", "m@example.com", ("custom-codex",)),
+                    ("codex1", "m@example.com", ("custom-codex",)),
+                    ("codex2", "z@example.com", ("fake-codex",)),
                 ],
             )
             self.assertIsNone(store.resolve_alias("codex3"))
@@ -478,7 +489,9 @@ class CodexStoreTests(unittest.TestCase):
             provider = CodexProvider(codex_home=codex_home)
             store = AuthStore(store_dir)
 
-            for name in ("a@example.com", "b@example.com"):
+            for mtime_ns, name in enumerate(
+                ("a@example.com", "b@example.com"), start=1
+            ):
                 active = codex_home / "auth.json"
                 if active.exists() or active.is_symlink():
                     active.unlink()
@@ -488,6 +501,10 @@ class CodexStoreTests(unittest.TestCase):
                 )
                 with store.lock():
                     store.save_current(provider, name)
+                os.utime(
+                    store.profile_path(provider, name),
+                    ns=(mtime_ns, mtime_ns),
+                )
 
             with contextlib.redirect_stdout(io.StringIO()):
                 status = cli_main(
@@ -511,7 +528,9 @@ class CodexStoreTests(unittest.TestCase):
             with contextlib.redirect_stdout(out):
                 status = cli_main(["--store-dir", str(store_dir), "alias", "list"])
             self.assertEqual(status, 0)
-            self.assertIn("codex1 -> codex:a@example.com -- fake-codex", out.getvalue())
+            # sync_numbered_aliases reorders: b (newer) → codex1,
+            # a → codex2 with the custom command preserved.
+            self.assertIn("codex2 -> codex:a@example.com -- fake-codex", out.getvalue())
 
             calls = []
 
@@ -529,6 +548,7 @@ class CodexStoreTests(unittest.TestCase):
                 return 0
 
             with mock.patch("ai_auth_switch.wrapper.subprocess.call", fake_call):
+                # codex2 now holds the custom command; codex1 → b (newer).
                 status = cli_main(
                     [
                         "--store-dir",
@@ -537,7 +557,7 @@ class CodexStoreTests(unittest.TestCase):
                         str(codex_home),
                         "alias",
                         "run",
-                        "codex1",
+                        "codex2",
                         "--",
                         "-C",
                         "/tmp/workspace",

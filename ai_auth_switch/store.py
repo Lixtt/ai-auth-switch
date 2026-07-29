@@ -46,6 +46,15 @@ def numbered_codex_alias_index(name: str) -> int | None:
     return int(match.group(1)) if match is not None else None
 
 
+def _profile_mtime_desc_key(path: Path) -> tuple[int, str]:
+    """Sort key: newest (largest mtime_ns) first, tie-break by name."""
+    try:
+        modified_ns = path.stat().st_mtime_ns
+    except OSError:
+        modified_ns = 0
+    return (-modified_ns, path.name)
+
+
 def set_private_permissions(path: Path) -> None:
     try:
         if path.is_dir():
@@ -169,8 +178,9 @@ class AuthStore:
         set_private_permissions(root)
 
         active = self.current_profile(provider)
+        paths = sorted(root.glob("*.json"), key=_profile_mtime_desc_key)
         profiles = []
-        for path in sorted(root.glob("*.json")):
+        for path in paths:
             name = path.stem
             profiles.append(
                 ProfileInfo(
@@ -336,7 +346,13 @@ class AuthStore:
         return sorted(aliases.values(), key=self._alias_sort_key)
 
     def sync_numbered_aliases(self, provider: Provider) -> list[AliasInfo]:
-        """Keep codex1, codex2, ... contiguous and aligned with saved profiles."""
+        """Keep codex1, codex2, ... contiguous and aligned with saved profiles.
+
+        Profiles are ordered by modification time, newest first.  A newly
+        saved profile becomes ``codex1`` and existing numbered aliases shift
+        down accordingly.  Custom per-alias commands are preserved across
+        reordering.
+        """
         if provider.id != "codex":
             return []
 
@@ -344,34 +360,38 @@ class AuthStore:
         profile_paths = self._profile_paths_in_initial_alias_order(provider)
         profile_names = {path.stem for path in profile_paths}
 
-        numbered = sorted(
-            (
-                (index, alias)
-                for alias in aliases.values()
-                if (index := numbered_codex_alias_index(alias.name)) is not None
-            ),
-            key=lambda item: item[0],
-        )
-
-        ordered_profiles: list[tuple[str, tuple[str, ...]]] = []
-        assigned_profiles: set[str] = set()
-        for _, alias in numbered:
-            if (
-                alias.provider_id == provider.id
-                and alias.profile in profile_names
-                and alias.profile not in assigned_profiles
-            ):
-                ordered_profiles.append((alias.profile, alias.command))
-                assigned_profiles.add(alias.profile)
-
         default_command = tuple(str(part) for part in provider.login_command)
         if not default_command and profile_paths:
             raise AiAuthSwitchError("automatic Codex alias command cannot be empty")
-        for path in profile_paths:
-            if path.stem not in assigned_profiles:
-                ordered_profiles.append((path.stem, default_command))
-                assigned_profiles.add(path.stem)
 
+        # Collect custom commands from existing numbered aliases.
+        # When multiple numbered aliases map to the same profile (can happen
+        # transiently after a manual ``alias set``), prefer a non-default
+        # command; if both are non-default, the lower-numbered alias wins.
+        custom_command: dict[str, tuple[str, ...]] = {}
+        for alias in sorted(
+            aliases.values(),
+            key=lambda a: numbered_codex_alias_index(a.name) or 0,
+        ):
+            if (
+                numbered_codex_alias_index(alias.name) is None
+                or alias.provider_id != provider.id
+                or alias.profile not in profile_names
+            ):
+                continue
+            existing = custom_command.get(alias.profile)
+            if existing is None:
+                custom_command[alias.profile] = alias.command
+            elif alias.command != default_command and existing == default_command:
+                custom_command[alias.profile] = alias.command
+
+        # Build ordered list: newest profile first → codex1.
+        ordered_profiles: list[tuple[str, tuple[str, ...]]] = []
+        for path in profile_paths:
+            command = custom_command.get(path.stem, default_command)
+            ordered_profiles.append((path.stem, command))
+
+        # Keep non-numbered aliases unchanged.
         updated = {
             name: alias
             for name, alias in aliases.items()
@@ -439,18 +459,11 @@ class AuthStore:
         return (1, alias.name)
 
     def _profile_paths_in_initial_alias_order(self, provider: Provider) -> list[Path]:
+        """Return profile files ordered newest-first (→ codex1)."""
         root = self.provider_dir(provider)
         if not root.exists():
             return []
-
-        def saved_order(path: Path) -> tuple[int, str]:
-            try:
-                modified_ns = path.stat().st_mtime_ns
-            except OSError:
-                modified_ns = 0
-            return (modified_ns, path.name)
-
-        return sorted(root.glob("*.json"), key=saved_order)
+        return sorted(root.glob("*.json"), key=_profile_mtime_desc_key)
 
     @contextlib.contextmanager
     def activated_temporarily(self, provider: Provider, name: str) -> Iterator[ProfileInfo]:
