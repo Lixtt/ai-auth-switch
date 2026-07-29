@@ -394,6 +394,14 @@ def _cmd_auth_list(args: argparse.Namespace) -> int:
             if alias.provider_id == provider.id
             and numbered_codex_alias_index(alias.name) is not None
         }
+        # Sort profiles by codex alias index so the list reads codex1, codex2, ...
+        def _profile_sort_key(p: ProfileInfo) -> tuple[int, int | str]:
+            alias_name = aliases_by_profile.get(p.name)
+            if alias_name is not None:
+                return (0, numbered_codex_alias_index(alias_name) or 0)
+            return (1, p.name)
+
+        profiles = sorted(profiles, key=_profile_sort_key)
         if len(provider_ids) > 1:
             if index and not args.json:
                 print()
