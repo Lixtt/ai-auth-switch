@@ -259,6 +259,44 @@ def _print_alias_link_sync(result: AliasLinkSyncResult) -> None:
         )
 
 
+BUILTIN_SHORTCUTS = ("ais",)
+
+
+def _ensure_builtin_shortcut(
+    name: str,
+    *,
+    bin_dir: Path,
+    target: Path,
+) -> None:
+    """Ensure a built-in shortcut symlink (e.g. ``ais``) exists in *bin_dir*."""
+    link = bin_dir / name
+    if link.is_symlink() and _symlink_points_to(link, target):
+        return
+    if link.exists():
+        if _is_managed_alias_link(link):
+            try:
+                _replace_symlink(link, target)
+            except OSError as exc:
+                print(
+                    f"ai-auth-switch: failed to update built-in shortcut {link}: {exc}",
+                    file=sys.stderr,
+                )
+        else:
+            print(
+                f"ai-auth-switch: built-in shortcut not installed; path already exists: {link}",
+                file=sys.stderr,
+            )
+        return
+    try:
+        os.symlink(target, link)
+        print(f"installed built-in shortcut {link.name} -> {os.readlink(link)}")
+    except OSError as exc:
+        print(
+            f"ai-auth-switch: failed to install built-in shortcut {link}: {exc}",
+            file=sys.stderr,
+        )
+
+
 def _sync_automatic_alias_links(
     args: argparse.Namespace,
     aliases: Sequence[AliasInfo],
@@ -266,16 +304,19 @@ def _sync_automatic_alias_links(
     bin_dir = _automatic_alias_bin_dir(args)
     if bin_dir is None:
         return
+    target = _alias_executable_target()
     try:
         result = _sync_numbered_alias_executables(
             aliases,
             bin_dir=bin_dir,
-            target=_alias_executable_target(),
+            target=target,
         )
     except AiAuthSwitchError as exc:
         print(f"ai-auth-switch: automatic alias sync failed: {exc}", file=sys.stderr)
         return
     _print_alias_link_sync(result)
+    for name in BUILTIN_SHORTCUTS:
+        _ensure_builtin_shortcut(name, bin_dir=bin_dir, target=target)
 
 
 def _auth_hint(provider: Provider) -> str:
