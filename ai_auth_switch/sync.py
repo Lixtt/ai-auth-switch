@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import json
 import os
 import shutil
@@ -13,7 +12,7 @@ from typing import Any
 
 from ai_auth_switch.errors import AiAuthSwitchError
 from ai_auth_switch.providers import Provider
-from ai_auth_switch.store import set_private_permissions
+from ai_auth_switch.utils import atomic_write, decode_jwt_payload, set_private_permissions
 
 
 OPENAI_CODEX_PROVIDER = "openai-codex"
@@ -61,28 +60,10 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    set_private_permissions(path.parent)
-    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    set_private_permissions(tmp)
-    os.replace(tmp, path)
-    set_private_permissions(path)
-
-
-def _decode_jwt_payload(token: str) -> dict[str, Any]:
-    parts = token.split(".")
-    if len(parts) < 2:
-        return {}
-    payload = parts[1] + "=" * (-len(parts[1]) % 4)
-    try:
-        decoded = base64.urlsafe_b64decode(payload.encode("ascii"))
-        data = json.loads(decoded)
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
+    atomic_write(
+        path,
+        json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+    )
 
 
 def _summarize_codex_auth(auth_path: Path) -> dict[str, Any]:
@@ -95,8 +76,8 @@ def _summarize_codex_auth(auth_path: Path) -> dict[str, Any]:
     if not isinstance(access_token, str) or not access_token.strip():
         return {}
 
-    id_payload = _decode_jwt_payload(str(tokens.get("id_token") or ""))
-    access_payload = _decode_jwt_payload(access_token)
+    id_payload = decode_jwt_payload(str(tokens.get("id_token") or ""))
+    access_payload = decode_jwt_payload(access_token)
     auth_claims = access_payload.get("https://api.openai.com/auth")
     if not isinstance(auth_claims, dict):
         auth_claims = {}
@@ -217,145 +198,7 @@ def _sync_hermes_codex_cli_access_token(
     python: Path,
     agent_dir: Path,
 ) -> SyncResult:
-    helper = r"""
-import json
-import os
-import sys
-from pathlib import Path
-
-agent_dir = Path(os.environ["AI_AUTH_SWITCH_HERMES_AGENT_DIR"])
-sys.path.insert(0, str(agent_dir))
-
-from hermes_cli.auth import (  # noqa: E402
-    DEFAULT_CODEX_BASE_URL,
-    _auth_store_lock,
-    _load_auth_store,
-    _save_auth_store,
-    _update_config_for_provider,
-)
-from hermes_cli.codex_runtime_switch import set_runtime  # noqa: E402
-from hermes_cli.config import load_config, save_config  # noqa: E402
-from agent.credential_pool import load_pool  # noqa: E402
-
-
-profile_name = os.environ["AI_AUTH_SWITCH_HERMES_PROFILE_NAME"]
-active_auth_path = Path(os.environ["AI_AUTH_SWITCH_CODEX_AUTH_PATH"])
-cli_access_source = os.environ["AI_AUTH_SWITCH_HERMES_CLI_ACCESS_SOURCE"]
-legacy_bridge_source = os.environ["AI_AUTH_SWITCH_HERMES_LEGACY_BRIDGE_SOURCE"]
-base_url = DEFAULT_CODEX_BASE_URL
-
-try:
-    codex_auth = json.loads(active_auth_path.read_text(encoding="utf-8"))
-except Exception as exc:
-    raise SystemExit(f"failed to read Codex auth file {active_auth_path}: {exc}")
-tokens = codex_auth.get("tokens")
-if not isinstance(tokens, dict):
-    raise SystemExit(f"Codex auth file {active_auth_path} does not contain tokens")
-access_token = tokens.get("access_token")
-if not isinstance(access_token, str) or not access_token.strip():
-    raise SystemExit(f"Codex auth file {active_auth_path} is missing access_token")
-access_token = access_token.strip()
-
-def _decode_jwt_payload(token):
-    parts = token.split(".")
-    if len(parts) < 2:
-        return {}
-    payload = parts[1] + "=" * (-len(parts[1]) % 4)
-    try:
-        import base64
-        return json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
-    except Exception:
-        return {}
-
-access_payload = _decode_jwt_payload(access_token)
-expires_at_ms = None
-exp = access_payload.get("exp")
-if isinstance(exp, (int, float)):
-    expires_at_ms = int(exp * 1000)
-
-config_path = _update_config_for_provider("openai-codex", base_url)
-config = load_config()
-model_cfg = config.get("model")
-if not isinstance(model_cfg, dict):
-    model_cfg = {}
-    config["model"] = model_cfg
-model_cfg["provider"] = "openai-codex"
-model_cfg["base_url"] = base_url
-current_default = str(model_cfg.get("default") or "").strip()
-if not current_default.startswith("gpt-"):
-    model_cfg["default"] = os.environ["AI_AUTH_SWITCH_HERMES_DEFAULT_MODEL"]
-set_runtime(config, "auto")
-save_config(config)
-
-with _auth_store_lock():
-    auth_store = _load_auth_store()
-    providers = auth_store.get("providers")
-    if isinstance(providers, dict):
-        providers.pop("openai-codex", None)
-    pool = auth_store.get("credential_pool")
-    if not isinstance(pool, dict):
-        pool = {}
-        auth_store["credential_pool"] = pool
-    existing = pool.get("openai-codex")
-    retained = []
-    if isinstance(existing, list):
-        retained = [
-            item
-            for item in existing
-            if isinstance(item, dict)
-            and item.get("source") not in {
-                "device_code",
-                "manual:device_code",
-                legacy_bridge_source,
-                cli_access_source,
-            }
-        ]
-    cli_entry = {
-        "id": "codex-cli-access-token",
-        "label": f"Codex CLI ({profile_name})",
-        "auth_type": "api_key",
-        "priority": 0,
-        "source": cli_access_source,
-        "access_token": access_token,
-        "base_url": base_url,
-        "last_status": None,
-        "last_status_at": None,
-        "last_error_code": None,
-        "last_error_reason": None,
-        "last_error_message": None,
-        "last_error_reset_at": None,
-        "request_count": 0,
-    }
-    last_refresh = codex_auth.get("last_refresh")
-    if isinstance(last_refresh, str) and last_refresh.strip():
-        cli_entry["last_refresh"] = last_refresh.strip()
-    if expires_at_ms is not None:
-        cli_entry["expires_at_ms"] = expires_at_ms
-    retained.insert(0, cli_entry)
-    for index, item in enumerate(retained):
-        if isinstance(item, dict):
-            item["priority"] = index
-    pool["openai-codex"] = retained
-    suppressed = auth_store.get("suppressed_sources")
-    if isinstance(suppressed, dict):
-        suppressed.pop("openai-codex", None)
-        if not suppressed:
-            auth_store.pop("suppressed_sources", None)
-    auth_store["active_provider"] = "openai-codex"
-    _save_auth_store(auth_store)
-
-try:
-    load_pool("openai-codex")
-except Exception:
-    pass
-print(json.dumps({
-    "status": "synced",
-    "config": str(config_path),
-    "runtime": "auto",
-    "profile": profile_name,
-    "expires_at_ms": expires_at_ms,
-}, ensure_ascii=False))
-"""
+    helper = Path(__file__).with_name("hermes_codex_sync.py")
 
     env = os.environ.copy()
     env["AI_AUTH_SWITCH_HERMES_AGENT_DIR"] = str(agent_dir)
@@ -366,7 +209,7 @@ print(json.dumps({
     env["AI_AUTH_SWITCH_HERMES_DEFAULT_MODEL"] = HERMES_CODEX_DEFAULT_MODEL
     try:
         completed = subprocess.run(
-            [str(python), "-c", helper],
+            [str(python), str(helper)],
             check=False,
             capture_output=True,
             text=True,
@@ -625,8 +468,8 @@ def _build_openclaw_openai_profile(active_auth_path: Path) -> dict[str, Any]:
     refresh_token = refresh_token.strip()
     id_token = id_token.strip() if isinstance(id_token, str) and id_token.strip() else None
 
-    access_payload = _decode_jwt_payload(access_token)
-    id_payload = _decode_jwt_payload(id_token or "")
+    access_payload = decode_jwt_payload(access_token)
+    id_payload = decode_jwt_payload(id_token or "")
     access_auth = _dict_claim(access_payload, "https://api.openai.com/auth")
     id_auth = _dict_claim(id_payload, "https://api.openai.com/auth")
     access_profile = _dict_claim(access_payload, "https://api.openai.com/profile")
@@ -699,12 +542,9 @@ def _sync_systemd_proxy_environment(systemctl: str) -> str | None:
             timeout=10,
         )
         if completed.returncode != 0:
-            output = "\n".join(
-                line
-                for line in (completed.stdout + "\n" + completed.stderr).splitlines()
-                if line.strip()
+            details.append(
+                f"proxy import exited {completed.returncode}: {_tail(_captured_output(completed))}"
             )
-            details.append(f"proxy import exited {completed.returncode}: {_tail(output)}")
     if absent:
         completed = subprocess.run(
             [systemctl, "--user", "unset-environment", *absent],
@@ -714,29 +554,34 @@ def _sync_systemd_proxy_environment(systemctl: str) -> str | None:
             timeout=10,
         )
         if completed.returncode != 0:
-            output = "\n".join(
-                line
-                for line in (completed.stdout + "\n" + completed.stderr).splitlines()
-                if line.strip()
+            details.append(
+                f"proxy unset exited {completed.returncode}: {_tail(_captured_output(completed))}"
             )
-            details.append(f"proxy unset exited {completed.returncode}: {_tail(output)}")
     if details:
         return "; ".join(details)
     return "proxy environment imported" if present else "proxy environment cleared"
 
 
-def _restart_hermes_gateway() -> SyncResult:
+def _captured_output(completed: subprocess.CompletedProcess) -> str:
+    return "\n".join(
+        line
+        for line in (completed.stdout + "\n" + completed.stderr).splitlines()
+        if line.strip()
+    )
+
+
+def _restart_gateway(service: str) -> SyncResult:
     systemctl = shutil.which("systemctl")
     if not systemctl:
         return SyncResult(
-            target="hermes-gateway",
+            target=service,
             status="skipped",
             message="systemctl not found",
         )
 
     try:
         active = subprocess.run(
-            [systemctl, "--user", "is-active", "--quiet", "hermes-gateway.service"],
+            [systemctl, "--user", "is-active", "--quiet", f"{service}.service"],
             check=False,
             capture_output=True,
             text=True,
@@ -744,15 +589,15 @@ def _restart_hermes_gateway() -> SyncResult:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return SyncResult(
-            target="hermes-gateway",
+            target=service,
             status="skipped",
             message=f"could not check service state: {exc}",
         )
     if active.returncode != 0:
         return SyncResult(
-            target="hermes-gateway",
+            target=service,
             status="skipped",
-            message="hermes-gateway.service is not active",
+            message=f"{service}.service is not active",
         )
 
     try:
@@ -762,7 +607,7 @@ def _restart_hermes_gateway() -> SyncResult:
 
     try:
         restarted = subprocess.run(
-            [systemctl, "--user", "restart", "hermes-gateway.service"],
+            [systemctl, "--user", "restart", f"{service}.service"],
             check=False,
             capture_output=True,
             text=True,
@@ -770,107 +615,36 @@ def _restart_hermes_gateway() -> SyncResult:
         )
     except subprocess.TimeoutExpired:
         return SyncResult(
-            target="hermes-gateway",
+            target=service,
             status="error",
             message="restart timed out",
         )
     except OSError as exc:
         return SyncResult(
-            target="hermes-gateway",
+            target=service,
             status="error",
             message=f"restart failed: {exc}",
         )
     if restarted.returncode != 0:
-        output = "\n".join(
-            line
-            for line in (restarted.stdout + "\n" + restarted.stderr).splitlines()
-            if line.strip()
-        )
         return SyncResult(
-            target="hermes-gateway",
+            target=service,
             status="error",
-            message=f"restart exited {restarted.returncode}: {_tail(output)}",
+            message=f"restart exited {restarted.returncode}: {_tail(_captured_output(restarted))}",
         )
     suffix = f"; {proxy_env_message}" if proxy_env_message else ""
     return SyncResult(
-        target="hermes-gateway",
+        target=service,
         status="synced",
         message=f"service restarted{suffix}",
     )
+
+
+def _restart_hermes_gateway() -> SyncResult:
+    return _restart_gateway("hermes-gateway")
 
 
 def _restart_openclaw_gateway() -> SyncResult:
-    systemctl = shutil.which("systemctl")
-    if not systemctl:
-        return SyncResult(
-            target="openclaw-gateway",
-            status="skipped",
-            message="systemctl not found",
-        )
-
-    try:
-        active = subprocess.run(
-            [systemctl, "--user", "is-active", "--quiet", "openclaw-gateway.service"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return SyncResult(
-            target="openclaw-gateway",
-            status="skipped",
-            message=f"could not check service state: {exc}",
-        )
-    if active.returncode != 0:
-        return SyncResult(
-            target="openclaw-gateway",
-            status="skipped",
-            message="openclaw-gateway.service is not active",
-        )
-
-    try:
-        proxy_env_message = _sync_systemd_proxy_environment(systemctl)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        proxy_env_message = f"proxy environment sync failed: {exc}"
-
-    try:
-        restarted = subprocess.run(
-            [systemctl, "--user", "restart", "openclaw-gateway.service"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except subprocess.TimeoutExpired:
-        return SyncResult(
-            target="openclaw-gateway",
-            status="error",
-            message="restart timed out",
-        )
-    except OSError as exc:
-        return SyncResult(
-            target="openclaw-gateway",
-            status="error",
-            message=f"restart failed: {exc}",
-        )
-    if restarted.returncode != 0:
-        output = "\n".join(
-            line
-            for line in (restarted.stdout + "\n" + restarted.stderr).splitlines()
-            if line.strip()
-        )
-        return SyncResult(
-            target="openclaw-gateway",
-            status="error",
-            message=f"restart exited {restarted.returncode}: {_tail(output)}",
-        )
-    suffix = f"; {proxy_env_message}" if proxy_env_message else ""
-    return SyncResult(
-        target="openclaw-gateway",
-        status="synced",
-        message=f"service restarted{suffix}",
-    )
+    return _restart_gateway("openclaw-gateway")
 
 
 def _last_json_object(output: str) -> dict[str, Any] | None:

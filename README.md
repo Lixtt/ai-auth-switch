@@ -264,6 +264,67 @@ The profile store can be moved with:
 AI_AUTH_SWITCH_HOME=/secure/path ai-auth-switch auth list codex
 ```
 
+## Default Profile and Directory Binding
+
+`run` normally needs an explicit profile name. When you omit it, the profile is
+resolved from the provider's default profile first, then from the nearest
+directory binding:
+
+```bash
+ai-auth-switch run codex -- codex -C ~/workspace/project   # still explicit
+ai-auth-switch run codex                                    # uses default/binding
+```
+
+Set, show, and clear the default profile per provider:
+
+```bash
+ai-auth-switch auth default codex someone@example.com
+ai-auth-switch auth default codex
+#   default profile -> someone@example.com
+ai-auth-switch auth default codex --clear
+```
+
+Directory bindings select a profile automatically for every `run` inside a
+project tree. The binding is stored in `.ai-auth-switch.json` in the target
+directory and resolved from the nearest ancestor:
+
+```bash
+cd ~/workspace/project
+ai-auth-switch auth bind codex someone@example.com
+ai-auth-switch auth bind codex
+#   bound profile -> someone@example.com (resolved from /home/me/workspace/project)
+ai-auth-switch auth bind codex --clear
+```
+
+Use `--dir` to bind a directory other than the current one. Bindings take
+precedence over the default profile when both exist. If neither is set, `run`
+without a profile prints a message explaining both options.
+
+## Migrating Profiles Between Machines
+
+Saved profiles (including their OAuth credentials) can be exported as JSON and
+imported on another machine. This is useful when the checkout and home are not
+shared:
+
+```bash
+# On the source machine.
+ai-auth-switch auth export codex -o codex-profiles.json
+ai-auth-switch auth export              # all providers, to stdout
+```
+
+The export file is written with private permissions (`0600`) and contains
+credentials; keep it secure and delete it after migrating. Import it on the
+target machine, or pipe it directly when the two machines can talk over SSH:
+
+```bash
+ai-auth-switch auth import codex-profiles.json
+ai-auth-switch auth export | ai-auth-switch auth import -   # pipe, no file
+```
+
+Existing profiles with the same name are skipped to avoid clobbering local
+state; pass `--force` to overwrite them. Imported profiles automatically get
+their numbered aliases (`codex1`, `codex2`, ...) on the target machine.
+
 ## Architecture
 
 `ai-auth-switch` has three separate layers:

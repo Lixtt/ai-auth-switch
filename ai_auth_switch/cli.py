@@ -10,15 +10,27 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import NoReturn, Sequence
 
 from ai_auth_switch import __version__
+from ai_auth_switch.complete import (
+    bash_completion_script,
+    complete_words,
+    fish_completion_script,
+    zsh_completion_script,
+)
 from ai_auth_switch.errors import AiAuthSwitchError
 from ai_auth_switch.providers import Provider, get_provider
 from ai_auth_switch.store import (
     AliasInfo,
     AuthStore,
+    ProfileInfo,
+    clear_binding,
     numbered_codex_alias_index,
+    read_binding,
+    resolve_binding,
+    sanitize_profile_name,
+    write_binding,
 )
 from ai_auth_switch.sync import SyncResult, sync_codex_dependents
 from ai_auth_switch.usage import fetch_profile_usage, format_usage, usage_to_dict
@@ -56,7 +68,7 @@ class HelpfulArgumentParser(argparse.ArgumentParser):
             self.error(message)
         return super()._check_value(action, value)
 
-    def error(self, message: str) -> None:
+    def error(self, message: str) -> NoReturn:
         self.print_help(sys.stderr)
         self._print_message(f"\nerror: {message}\n", sys.stderr)
         raise CliUsageError(message)
@@ -319,6 +331,16 @@ def _sync_automatic_alias_links(
         _ensure_builtin_shortcut(name, bin_dir=bin_dir, target=target)
 
 
+def _profile_sort_key(
+    aliases_by_profile: dict[str, str],
+    profile: ProfileInfo,
+) -> tuple[int, int | str]:
+    alias_name = aliases_by_profile.get(profile.name)
+    if alias_name is not None:
+        return (0, numbered_codex_alias_index(alias_name) or 0)
+    return (1, profile.name)
+
+
 def _auth_hint(provider: Provider) -> str:
     active = provider.active_auth_path
     if not active.exists() and not active.is_symlink():
@@ -394,14 +416,10 @@ def _cmd_auth_list(args: argparse.Namespace) -> int:
             if alias.provider_id == provider.id
             and numbered_codex_alias_index(alias.name) is not None
         }
-        # Sort profiles by codex alias index so the list reads codex1, codex2, ...
-        def _profile_sort_key(p: ProfileInfo) -> tuple[int, int | str]:
-            alias_name = aliases_by_profile.get(p.name)
-            if alias_name is not None:
-                return (0, numbered_codex_alias_index(alias_name) or 0)
-            return (1, p.name)
-
-        profiles = sorted(profiles, key=_profile_sort_key)
+        profiles = sorted(
+            profiles,
+            key=lambda p: _profile_sort_key(aliases_by_profile, p),
+        )
         if len(provider_ids) > 1:
             if index and not args.json:
                 print()
@@ -465,6 +483,200 @@ def _cmd_auth_current(args: argparse.Namespace) -> int:
         suffix = " (content match)" if current.by_content else ""
         print(f"{prefix}{current.name}{suffix}")
     return 1 if missing else 0
+
+
+def _cmd_auth_default(args: argparse.Namespace) -> int:
+    """Show, set, or clear the default profile per provider.
+
+    The default profile is used by ``run`` (and other profile consumers) when
+    no explicit profile is given. Bindings take precedence over the default.
+    """
+    store = _store_from_args(args)
+    provider_ids = _provider_ids(args)
+    if args.clear:
+        for provider_id in provider_ids:
+            store.clear_default(_provider_by_id(provider_id, args))
+        print(f"cleared default profile for {', '.join(provider_ids)}")
+        return 0
+    if args.name:
+        if not args.provider:
+            raise AiAuthSwitchError(
+                "provider is required when setting a default profile"
+            )
+        provider = _provider_by_id(args.provider, args)
+        store.set_default(provider, args.name)
+        print(f"default {provider.id} profile -> {args.name}")
+        return 0
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "providers": {
+                        provider_id: {
+                            "default": store.get_default(
+                                _provider_by_id(provider_id, args)
+                            )
+                        }
+                        for provider_id in provider_ids
+                    }
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    for provider_id in provider_ids:
+        provider = _provider_by_id(provider_id, args)
+        current = store.get_default(provider)
+        prefix = f"{provider.id}: " if len(provider_ids) > 1 else ""
+        if current:
+            print(f"{prefix}default profile -> {current}")
+        else:
+            print(f"{prefix}no default profile")
+    return 0
+
+
+def _cmd_auth_bind(args: argparse.Namespace) -> int:
+    """Show, set, or clear the directory binding for a provider.
+
+    Bindings are stored in ``.ai-auth-switch.json`` in the target directory and
+    resolved from the nearest ancestor directory.
+    """
+    store = _store_from_args(args)
+    target = Path(args.dir).expanduser().resolve() if args.dir else Path.cwd()
+    provider_ids = _provider_ids(args)
+    if args.clear:
+        for provider_id in provider_ids:
+            clear_binding(target, provider_id)
+        print(f"cleared binding for {', '.join(provider_ids)} in {target}")
+        return 0
+    if args.name:
+        if not args.provider:
+            raise AiAuthSwitchError(
+                "provider is required when setting a directory binding"
+            )
+        provider = _provider_by_id(args.provider, args)
+        if not store.profile_path(provider, args.name).exists():
+            raise AiAuthSwitchError(f"profile not found: {args.name}")
+        bindings = read_binding(target)
+        bindings[provider.id] = sanitize_profile_name(args.name)
+        write_binding(target, bindings)
+        print(f"bound {provider.id} profile {args.name} to {target}")
+        return 0
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "providers": {
+                        provider_id: {
+                            "binding": resolve_binding(provider_id, target),
+                            "dir": str(target),
+                        }
+                        for provider_id in provider_ids
+                    }
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    for provider_id in provider_ids:
+        provider = _provider_by_id(provider_id, args)
+        bound = resolve_binding(provider_id, target)
+        prefix = f"{provider.id}: " if len(provider_ids) > 1 else ""
+        if bound:
+            print(f"{prefix}bound profile -> {bound} (resolved from {target})")
+        else:
+            print(f"{prefix}no binding for {target}")
+    return 0
+
+
+def _cmd_auth_export(args: argparse.Namespace) -> int:
+    """Export saved profiles as JSON for migration to another machine."""
+    store = _store_from_args(args)
+    provider_ids = _provider_ids(args)
+    payload = {
+        "version": 1,
+        "providers": {
+            provider_id: store.export_provider_profiles(
+                _provider_by_id(provider_id, args)
+            )
+            for provider_id in provider_ids
+        },
+    }
+    text = json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
+    if args.output:
+        from ai_auth_switch.utils import atomic_write
+
+        output = Path(args.output).expanduser()
+        atomic_write(output, text)
+        print(f"exported {', '.join(provider_ids)} profiles to {output}")
+    else:
+        print(text, end="")
+    print(
+        "warning: the export contains credentials; keep it private",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def _cmd_auth_import(args: argparse.Namespace) -> int:
+    """Import profiles from a JSON export produced by ``auth export``.
+
+    Pass ``-`` as the file to read the export from standard input, enabling
+    ``ai-auth-switch auth export | ai-auth-switch auth import -`` pipelines.
+    """
+    store = _store_from_args(args)
+    if args.file == "-":
+        text = sys.stdin.read()
+        source = "<stdin>"
+    else:
+        path = Path(args.file).expanduser()
+        source = str(path)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise AiAuthSwitchError(f"failed to read {source}: {exc}") from exc
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise AiAuthSwitchError(f"invalid JSON in {source}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise AiAuthSwitchError(f"expected JSON object in {source}")
+    providers_data = data.get("providers")
+    if not isinstance(providers_data, dict):
+        raise AiAuthSwitchError(f"missing 'providers' object in {source}")
+
+    total_imported = 0
+    total_skipped = 0
+    for provider_id, profiles in sorted(providers_data.items()):
+        if not isinstance(provider_id, str) or not isinstance(profiles, dict):
+            continue
+        try:
+            provider = _provider_by_id(provider_id, args)
+        except AiAuthSwitchError:
+            print(
+                f"skipped unsupported provider in export: {provider_id}",
+                file=sys.stderr,
+            )
+            continue
+        with store.lock():
+            imported, skipped = store.import_provider_profiles(
+                provider,
+                profiles,
+                force=args.force,
+            )
+            automatic_aliases = store.sync_numbered_aliases(provider)
+            _sync_automatic_alias_links(args, automatic_aliases)
+        for name in imported:
+            print(f"imported {provider_id} profile {name}")
+        for name in skipped:
+            print(f"skipped existing {provider_id} profile {name}")
+        total_imported += len(imported)
+        total_skipped += len(skipped)
+    if total_imported == 0 and total_skipped == 0:
+        print("no profiles imported")
+    return 0
 
 
 def _cmd_auth_save(args: argparse.Namespace) -> int:
@@ -603,10 +815,22 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if not command:
         command = list(provider.login_command)
 
+    name = args.name
+    if not name:
+        name = store.get_default(provider) or resolve_binding(
+            provider.id, Path.cwd()
+        )
+    if not name:
+        raise AiAuthSwitchError(
+            f"no profile specified; pass a profile name, or set a default with "
+            f"`ai-auth-switch auth default {provider.id} <name>` or bind one to "
+            f"this directory with `ai-auth-switch auth bind {provider.id} <name>`"
+        )
+
     return run_with_profile(
         store,
         provider,
-        args.name,
+        name,
         command,
     )
 
@@ -714,6 +938,22 @@ def _cmd_alias_install(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_completion(args: argparse.Namespace) -> int:
+    scripts = {
+        "bash": bash_completion_script,
+        "zsh": zsh_completion_script,
+        "fish": fish_completion_script,
+    }
+    print(scripts[args.shell](), end="")
+    return 0
+
+
+def _cmd_complete(args: argparse.Namespace) -> int:
+    for candidate in complete_words(args.words):
+        print(candidate)
+    return 0
+
+
 def _program_alias_name(program_name: str) -> str | None:
     name = Path(program_name).name
     if name in PROGRAM_NAMES or name.startswith("ai-auth-switch"):
@@ -740,7 +980,24 @@ def _maybe_run_program_alias(
     return _run_alias(store, alias, argv)
 
 
-def build_parser(*, prog: str = "ai-auth-switch") -> argparse.ArgumentParser:
+def build_parser(
+    *,
+    prog: str = "ai-auth-switch",
+    require_command: bool = True,
+    completion: bool = False,
+) -> argparse.ArgumentParser:
+    """Build the CLI argument parser.
+
+    *require_command* controls whether a top-level command is mandatory.
+    *completion* builds a tolerant variant for shell completion where every
+    positional is optional, so ``parse_known_args`` succeeds on partial input
+    such as ``auth use codex`` and the completion walker can suggest the next
+    token.
+    """
+
+    def opt(nargs: object) -> object:
+        return "?" if completion else nargs
+
     parser = HelpfulArgumentParser(
         prog=prog,
         description="Switch auth profiles for AI coding agents.",
@@ -760,10 +1017,14 @@ def build_parser(*, prog: str = "ai-auth-switch") -> argparse.ArgumentParser:
         help="Do not sync Hermes/OpenClaw after changing active Codex auth.",
     )
 
-    subparsers = parser.add_subparsers(dest="command_name", required=True)
+    subparsers = parser.add_subparsers(
+        dest="command_name", required=require_command
+    )
 
     auth = subparsers.add_parser("auth", help="Manage saved auth profiles.")
-    auth_sub = auth.add_subparsers(dest="auth_command", required=True)
+    auth_sub = auth.add_subparsers(
+        dest="auth_command", required=require_command
+    )
 
     auth_list = auth_sub.add_parser("list", help="List profiles.")
     auth_list.add_argument("provider", nargs="?", choices=SUPPORTED_PROVIDERS)
@@ -810,20 +1071,20 @@ def build_parser(*, prog: str = "ai-auth-switch") -> argparse.ArgumentParser:
     auth_current.set_defaults(func=_cmd_auth_current)
 
     auth_save = auth_sub.add_parser("save", help="Save the active auth file as a profile.")
-    auth_save.add_argument("provider", choices=SUPPORTED_PROVIDERS)
+    auth_save.add_argument("provider", nargs=opt(None), choices=SUPPORTED_PROVIDERS)
     auth_save.add_argument("name", nargs="?")
     auth_save.set_defaults(func=_cmd_auth_save)
 
     auth_use = auth_sub.add_parser("use", help="Activate a saved profile.")
-    auth_use.add_argument("provider", choices=SUPPORTED_PROVIDERS)
-    auth_use.add_argument("name")
+    auth_use.add_argument("provider", nargs=opt(None), choices=SUPPORTED_PROVIDERS)
+    auth_use.add_argument("name", nargs=opt(None))
     auth_use.set_defaults(func=_cmd_auth_use)
 
     auth_sync = auth_sub.add_parser(
         "sync",
         help="Sync dependent tool auth from the active provider auth.",
     )
-    auth_sync.add_argument("provider", choices=SUPPORTED_PROVIDERS)
+    auth_sync.add_argument("provider", nargs=opt(None), choices=SUPPORTED_PROVIDERS)
     auth_sync.add_argument(
         "--no-hermes",
         action="store_true",
@@ -852,32 +1113,103 @@ def build_parser(*, prog: str = "ai-auth-switch") -> argparse.ArgumentParser:
     auth_sync.set_defaults(func=_cmd_auth_sync)
 
     auth_login = auth_sub.add_parser("login", help="Run provider login and save the result.")
-    auth_login.add_argument("provider", choices=SUPPORTED_PROVIDERS)
+    auth_login.add_argument("provider", nargs=opt(None), choices=SUPPORTED_PROVIDERS)
     auth_login.add_argument("login_args", nargs=argparse.REMAINDER)
     auth_login.set_defaults(func=_cmd_auth_login)
 
     auth_rename = auth_sub.add_parser("rename", help="Rename a saved profile.")
-    auth_rename.add_argument("provider", choices=SUPPORTED_PROVIDERS)
-    auth_rename.add_argument("old")
-    auth_rename.add_argument("new")
+    auth_rename.add_argument("provider", nargs=opt(None), choices=SUPPORTED_PROVIDERS)
+    auth_rename.add_argument("old", nargs=opt(None))
+    auth_rename.add_argument("new", nargs=opt(None))
     auth_rename.set_defaults(func=_cmd_auth_rename)
 
     auth_remove = auth_sub.add_parser("remove", help="Remove a saved inactive profile.")
-    auth_remove.add_argument("provider", choices=SUPPORTED_PROVIDERS)
-    auth_remove.add_argument("name")
+    auth_remove.add_argument("provider", nargs=opt(None), choices=SUPPORTED_PROVIDERS)
+    auth_remove.add_argument("name", nargs=opt(None))
     auth_remove.set_defaults(func=_cmd_auth_remove)
+
+    auth_default = auth_sub.add_parser(
+        "default",
+        help="Show, set, or clear the default profile for a provider.",
+    )
+    auth_default.add_argument("provider", nargs="?", choices=SUPPORTED_PROVIDERS)
+    auth_default.add_argument("name", nargs="?")
+    auth_default.add_argument(
+        "--clear",
+        action="store_true",
+        help="Clear the default profile.",
+    )
+    auth_default.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit stable machine-readable JSON.",
+    )
+    auth_default.set_defaults(func=_cmd_auth_default)
+
+    auth_bind = auth_sub.add_parser(
+        "bind",
+        help="Show, set, or clear the profile bound to a directory.",
+    )
+    auth_bind.add_argument("provider", nargs="?", choices=SUPPORTED_PROVIDERS)
+    auth_bind.add_argument("name", nargs="?")
+    auth_bind.add_argument(
+        "--clear",
+        action="store_true",
+        help="Clear the binding in the target directory.",
+    )
+    auth_bind.add_argument(
+        "--dir",
+        help="Directory to bind instead of the current directory.",
+    )
+    auth_bind.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit stable machine-readable JSON.",
+    )
+    auth_bind.set_defaults(func=_cmd_auth_bind)
+
+    auth_export = auth_sub.add_parser(
+        "export",
+        help="Export saved profiles as JSON for migration.",
+    )
+    auth_export.add_argument("provider", nargs="?", choices=SUPPORTED_PROVIDERS)
+    auth_export.add_argument(
+        "-o",
+        "--output",
+        help="Write the export to FILE instead of stdout.",
+    )
+    auth_export.set_defaults(func=_cmd_auth_export)
+
+    auth_import = auth_sub.add_parser(
+        "import",
+        help="Import profiles from a JSON export.",
+    )
+    auth_import.add_argument("file", help="Export file produced by `auth export`.")
+    auth_import.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing profiles with the same name.",
+    )
+    auth_import.set_defaults(func=_cmd_auth_import)
 
     run = subparsers.add_parser(
         "run",
         help="Run a command with isolated auth while sharing normal Codex state.",
     )
-    run.add_argument("provider", choices=SUPPORTED_PROVIDERS)
-    run.add_argument("name")
+    run.add_argument("provider", nargs=opt(None), choices=SUPPORTED_PROVIDERS)
+    run.add_argument(
+        "name",
+        nargs="?",
+        help="Saved profile to activate; defaults to the provider default "
+        "or the nearest directory binding.",
+    )
     run.add_argument("command", nargs=argparse.REMAINDER)
     run.set_defaults(func=_cmd_run)
 
     alias = subparsers.add_parser("alias", help="Manage command aliases.")
-    alias_sub = alias.add_subparsers(dest="alias_command", required=True)
+    alias_sub = alias.add_subparsers(
+        dest="alias_command", required=require_command
+    )
 
     alias_list = alias_sub.add_parser("list", help="List command aliases.")
     alias_list.set_defaults(func=_cmd_alias_list)
@@ -886,15 +1218,15 @@ def build_parser(*, prog: str = "ai-auth-switch") -> argparse.ArgumentParser:
         "sync",
         help="Create and install contiguous codex1, codex2, ... aliases.",
     )
-    alias_sync.add_argument("provider", choices=SUPPORTED_PROVIDERS)
+    alias_sync.add_argument("provider", nargs=opt(None), choices=SUPPORTED_PROVIDERS)
     alias_sync.add_argument("--bin-dir", help="Directory for automatic alias symlinks.")
     alias_sync.add_argument("--target", help="ai-auth-switch executable target.")
     alias_sync.set_defaults(func=_cmd_alias_sync)
 
     alias_set = alias_sub.add_parser("set", help="Create or update a command alias.")
-    alias_set.add_argument("name", help="Alias executable name, for example codex1.")
-    alias_set.add_argument("provider", choices=SUPPORTED_PROVIDERS)
-    alias_set.add_argument("profile", help="Saved provider profile to activate.")
+    alias_set.add_argument("name", nargs=opt(None), help="Alias executable name, for example codex1.")
+    alias_set.add_argument("provider", nargs=opt(None), choices=SUPPORTED_PROVIDERS)
+    alias_set.add_argument("profile", nargs=opt(None), help="Saved provider profile to activate.")
     alias_set.add_argument(
         "command",
         nargs=argparse.REMAINDER,
@@ -903,11 +1235,11 @@ def build_parser(*, prog: str = "ai-auth-switch") -> argparse.ArgumentParser:
     alias_set.set_defaults(func=_cmd_alias_set)
 
     alias_remove = alias_sub.add_parser("remove", help="Remove a command alias.")
-    alias_remove.add_argument("name")
+    alias_remove.add_argument("name", nargs=opt(None))
     alias_remove.set_defaults(func=_cmd_alias_remove)
 
     alias_run = alias_sub.add_parser("run", help="Run a command alias by name.")
-    alias_run.add_argument("name")
+    alias_run.add_argument("name", nargs=opt(None))
     alias_run.add_argument("command", nargs=argparse.REMAINDER)
     alias_run.set_defaults(func=_cmd_alias_run)
 
@@ -915,7 +1247,7 @@ def build_parser(*, prog: str = "ai-auth-switch") -> argparse.ArgumentParser:
         "install",
         help="Install a symlink so the alias can be invoked directly.",
     )
-    alias_install.add_argument("name")
+    alias_install.add_argument("name", nargs=opt(None))
     alias_install.add_argument("--bin-dir", help="Directory for the alias symlink.")
     alias_install.add_argument("--target", help="ai-auth-switch executable target.")
     alias_install.add_argument(
@@ -924,6 +1256,21 @@ def build_parser(*, prog: str = "ai-auth-switch") -> argparse.ArgumentParser:
         help="Replace an existing alias executable.",
     )
     alias_install.set_defaults(func=_cmd_alias_install)
+
+    completion = subparsers.add_parser(
+        "completion",
+        help="Print a shell completion script for bash, zsh, or fish.",
+    )
+    completion.add_argument("shell", nargs=opt(None), choices=["bash", "zsh", "fish"])
+    completion.set_defaults(func=_cmd_completion)
+
+    hidden = subparsers.add_parser(
+        "__complete",
+        help=argparse.SUPPRESS,
+        description="Internal command used by shell completion.",
+    )
+    hidden.add_argument("words", nargs=argparse.REMAINDER)
+    hidden.set_defaults(func=_cmd_complete)
 
     return parser
 

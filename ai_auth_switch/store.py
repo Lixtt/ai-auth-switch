@@ -9,10 +9,11 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 from ai_auth_switch.errors import AiAuthSwitchError
 from ai_auth_switch.providers import Provider
+from ai_auth_switch.utils import atomic_write, set_private_permissions
 
 
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._@+-]+")
@@ -55,16 +56,6 @@ def _profile_mtime_desc_key(path: Path) -> tuple[int, str]:
     return (-modified_ns, path.name)
 
 
-def set_private_permissions(path: Path) -> None:
-    try:
-        if path.is_dir():
-            path.chmod(0o700)
-        else:
-            path.chmod(0o600)
-    except OSError:
-        pass
-
-
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -85,10 +76,15 @@ class FileLock:
         set_private_permissions(self.path)
         try:
             import fcntl
-
+        except ImportError:
+            # Non-POSIX host without advisory locks: proceed without locking.
+            return self
+        try:
             fcntl.flock(self._file.fileno(), fcntl.LOCK_EX)
-        except Exception:
-            pass
+        except BaseException:
+            self._file.close()
+            self._file = None
+            raise
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -96,10 +92,10 @@ class FileLock:
             if self._file is not None:
                 try:
                     import fcntl
-
-                    fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
-                except Exception:
+                except ImportError:
                     pass
+                else:
+                    fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
                 self._file.close()
         finally:
             self._file = None
@@ -139,9 +135,133 @@ class AuthStore:
     def aliases_path(self) -> Path:
         return self.base_dir / "aliases.json"
 
+    def defaults_path(self) -> Path:
+        return self.base_dir / "defaults.json"
+
     def profile_path(self, provider: Provider, name: str) -> Path:
         clean = sanitize_profile_name(name)
         return self.provider_dir(provider) / f"{clean}.json"
+
+    def read_profile_content(self, provider: Provider, name: str) -> str:
+        path = self.profile_path(provider, name)
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise AiAuthSwitchError(f"failed to read profile {name!r}: {exc}") from exc
+
+    def write_profile_content(self, provider: Provider, name: str, content: str) -> ProfileInfo:
+        path = self.profile_path(provider, name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        set_private_permissions(path.parent)
+        atomic_write(path, content)
+        return ProfileInfo(name=path.stem, path=path, active=False)
+
+    def export_provider_profiles(self, provider: Provider) -> dict[str, dict[str, Any]]:
+        """Return ``{profile_name: auth_json}`` for every saved profile.
+
+        Parsed objects are returned instead of raw text so the exported JSON
+        stays readable; import re-serializes them with private permissions.
+        """
+        exported: dict[str, dict[str, Any]] = {}
+        root = self.provider_dir(provider)
+        if not root.exists():
+            return exported
+        for path in sorted(root.glob("*.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(data, dict):
+                exported[path.stem] = data
+        return exported
+
+    def import_provider_profiles(
+        self,
+        provider: Provider,
+        profiles: dict[str, Any],
+        *,
+        force: bool = False,
+    ) -> tuple[list[str], list[str]]:
+        """Import profiles and return ``(imported_names, skipped_names)``.
+
+        Existing profiles are skipped unless *force* is set. Only names that
+        pass :func:`sanitize_profile_name` are accepted.
+        """
+        imported: list[str] = []
+        skipped: list[str] = []
+        for name, content in profiles.items():
+            if (
+                not isinstance(name, str)
+                or not name.strip()
+                or not isinstance(content, dict)
+            ):
+                continue
+            clean = sanitize_profile_name(name)
+            if clean != name:
+                continue
+            path = self.profile_path(provider, clean)
+            if path.exists() and not force:
+                skipped.append(clean)
+                continue
+            payload = (
+                json.dumps(content, indent=2, ensure_ascii=False, sort_keys=True)
+                + "\n"
+            )
+            self.write_profile_content(provider, clean, payload)
+            imported.append(clean)
+        return imported, skipped
+
+    def get_default(self, provider: Provider) -> str | None:
+        return self._read_defaults().get(provider.id)
+
+    def set_default(self, provider: Provider, name: str) -> None:
+        clean = sanitize_profile_name(name)
+        path = self.profile_path(provider, clean)
+        if not path.exists():
+            raise AiAuthSwitchError(f"profile not found: {name}")
+        defaults = self._read_defaults()
+        defaults[provider.id] = clean
+        self._write_defaults(defaults)
+
+    def clear_default(self, provider: Provider) -> None:
+        defaults = self._read_defaults()
+        if provider.id in defaults:
+            del defaults[provider.id]
+            self._write_defaults(defaults)
+
+    def _read_defaults(self) -> dict[str, str]:
+        path = self.defaults_path()
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return {}
+        providers = data.get("providers") if isinstance(data, dict) else None
+        if not isinstance(providers, dict):
+            return {}
+        return {
+            provider_id: sanitize_profile_name(profile)
+            for provider_id, profile in providers.items()
+            if isinstance(provider_id, str)
+            and provider_id.strip()
+            and isinstance(profile, str)
+            and profile.strip()
+        }
+
+    def _write_defaults(self, defaults: dict[str, str]) -> None:
+        self.ensure()
+        payload = {
+            "version": 1,
+            "providers": {
+                provider_id: profile
+                for provider_id, profile in sorted(defaults.items())
+            },
+        }
+        atomic_write(
+            self.defaults_path(),
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        )
 
     def lock(self) -> FileLock:
         self.ensure()
@@ -257,8 +377,6 @@ class AuthStore:
         os.replace(tmp, path)
         set_private_permissions(path)
         self.activate(provider, path.stem, backup_existing=False)
-        if provider.id == "codex":
-            self.sync_numbered_aliases(provider)
         return ProfileInfo(name=path.stem, path=path, active=True)
 
     def activate(
@@ -305,8 +423,6 @@ class AuthStore:
             if not (alias.provider_id == provider.id and alias.profile == path.stem)
         }
         self._write_aliases_if_changed(aliases)
-        if provider.id == "codex":
-            self.sync_numbered_aliases(provider)
 
     def rename(self, provider: Provider, old: str, new: str) -> ProfileInfo:
         old_path = self.profile_path(provider, old)
@@ -334,8 +450,6 @@ class AuthStore:
             for alias_name, alias in aliases.items()
         }
         self._write_aliases_if_changed(renamed_aliases)
-        if provider.id == "codex":
-            self.sync_numbered_aliases(provider)
         if current is not None and current.name == old_path.stem:
             self.activate(provider, new_path.stem, backup_existing=False)
             return ProfileInfo(name=new_path.stem, path=new_path, active=True)
@@ -676,8 +790,6 @@ class AuthStore:
 
     def _write_aliases(self, aliases: dict[str, AliasInfo]) -> None:
         self.ensure()
-        path = self.aliases_path()
-        tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
         payload = {
             "version": 1,
             "aliases": {
@@ -689,11 +801,84 @@ class AuthStore:
                 for alias in sorted(aliases.values(), key=lambda item: item.name)
             },
         }
-        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        set_private_permissions(tmp)
-        os.replace(tmp, path)
-        set_private_permissions(path)
+        atomic_write(
+            self.aliases_path(),
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        )
 
     def _write_aliases_if_changed(self, aliases: dict[str, AliasInfo]) -> None:
         if aliases != self._read_aliases():
             self._write_aliases(aliases)
+
+
+def binding_path(base_dir: Path) -> Path:
+    return Path(base_dir).expanduser() / ".ai-auth-switch.json"
+
+
+def read_binding(base_dir: Path) -> dict[str, str]:
+    path = binding_path(base_dir)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    providers = data.get("providers") if isinstance(data, dict) else None
+    if not isinstance(providers, dict):
+        return {}
+    return {
+        provider_id: sanitize_profile_name(profile)
+        for provider_id, profile in providers.items()
+        if isinstance(provider_id, str)
+        and provider_id.strip()
+        and isinstance(profile, str)
+        and profile.strip()
+    }
+
+
+def write_binding(base_dir: Path, providers: dict[str, str]) -> None:
+    payload = {
+        "version": 1,
+        "providers": {
+            provider_id: profile for provider_id, profile in sorted(providers.items())
+        },
+    }
+    atomic_write(
+        binding_path(base_dir),
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+    )
+
+
+def resolve_binding(provider_id: str, start_dir: Path) -> str | None:
+    """Return the profile bound to the nearest ancestor directory of *start_dir*."""
+    current = Path(start_dir).resolve()
+    while True:
+        binding = read_binding(current)
+        profile = binding.get(provider_id)
+        if profile:
+            return profile
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+
+
+def clear_binding(base_dir: Path, provider_id: str | None = None) -> None:
+    """Remove *provider_id* (or every provider when None) from *base_dir*'s binding.
+
+    The binding file itself is removed once it becomes empty.
+    """
+    path = binding_path(base_dir)
+    if not path.exists():
+        return
+    bindings = read_binding(base_dir)
+    if provider_id is None:
+        if bindings:
+            path.unlink()
+        return
+    if provider_id in bindings:
+        del bindings[provider_id]
+        if bindings:
+            write_binding(base_dir, bindings)
+        else:
+            path.unlink()

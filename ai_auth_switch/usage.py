@@ -1,15 +1,17 @@
 from __future__ import annotations
 
-import json
 import hashlib
-import os
+import json
 import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
+
+from ai_auth_switch import __version__
+from ai_auth_switch.utils import atomic_write, extract_account_id_from_jwt
 
 
 DEFAULT_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
@@ -43,7 +45,9 @@ def _read_auth(path: Path) -> tuple[str | None, str | None]:
         return None, None
     if not isinstance(data, dict):
         return None, None
-    tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+    tokens = data.get("tokens")
+    if not isinstance(tokens, dict):
+        tokens = {}
     access_token = tokens.get("access_token") or data.get("access_token")
     account_id = tokens.get("account_id") or data.get("account_id")
     if not isinstance(access_token, str) or not access_token.strip():
@@ -54,26 +58,7 @@ def _read_auth(path: Path) -> tuple[str | None, str | None]:
 
 
 def _account_id_from_jwt(token: str) -> str | None:
-    import base64
-
-    parts = token.split(".")
-    if len(parts) < 2:
-        return None
-    try:
-        payload = parts[1] + "=" * (-len(parts[1]) % 4)
-        data = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
-    except Exception:
-        return None
-    if not isinstance(data, dict):
-        return None
-    auth = data.get("https://api.openai.com/auth")
-    candidates = [
-        data.get("chatgpt_account_id"),
-        data.get("account_id"),
-        auth.get("chatgpt_account_id") if isinstance(auth, dict) else None,
-        auth.get("account_id") if isinstance(auth, dict) else None,
-    ]
-    return next((value for value in candidates if isinstance(value, str) and value), None)
+    return extract_account_id_from_jwt(token)
 
 
 def _window(value: object) -> UsageWindow | None:
@@ -113,7 +98,7 @@ def fetch_usage(
     *,
     timeout: float = 5.0,
     url: str = DEFAULT_USAGE_URL,
-    opener: Callable[..., object] = urllib.request.urlopen,
+    opener: Callable[..., Any] = urllib.request.urlopen,
 ) -> AccountUsage:
     token, account_id = _read_auth(auth_path)
     if not token:
@@ -121,13 +106,13 @@ def fetch_usage(
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
-        "User-Agent": "ai-auth-switch/0.1",
+        "User-Agent": f"ai-auth-switch/{__version__}",
     }
     if account_id:
         headers["ChatGPT-Account-Id"] = account_id
     request = urllib.request.Request(url, headers=headers)
     try:
-        with opener(request, timeout=timeout) as response:  # type: ignore[attr-defined]
+        with opener(request, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
         return parse_usage(data)
     except urllib.error.HTTPError as exc:
@@ -218,22 +203,20 @@ def _write_cache(
     if path is None or fingerprint is None:
         return
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.parent.chmod(0o700)
         payload = {
             "fetched_at": time.time(),
             "auth_fingerprint": fingerprint,
             "usage": usage_to_dict(usage),
         }
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-        temporary.chmod(0o600)
-        os.replace(temporary, path)
+        atomic_write(
+            path,
+            json.dumps(payload, separators=(",", ":")),
+        )
     except OSError:
         return
 
 
-def _window_to_dict(window: UsageWindow | None) -> dict | None:
+def _window_to_dict(window: UsageWindow | None) -> dict[str, Any] | None:
     if window is None:
         return None
     return {
@@ -243,7 +226,7 @@ def _window_to_dict(window: UsageWindow | None) -> dict | None:
     }
 
 
-def usage_to_dict(usage: AccountUsage) -> dict:
+def usage_to_dict(usage: AccountUsage) -> dict[str, Any]:
     return {
         "plan_type": usage.plan_type,
         "primary": _window_to_dict(usage.primary),

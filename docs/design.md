@@ -25,6 +25,20 @@ break the symlink. Before switching away, `ai-auth-switch` matches the active
 auth file back to a saved profile by stable Codex account identity and syncs
 the replacement file into that profile.
 
+A profile can be selected implicitly:
+
+- `defaults.json` stores the per-provider default profile (`auth default`).
+- `.ai-auth-switch.json` in a directory binds a profile to that project tree
+  (`auth bind`); bindings resolve from the nearest ancestor directory.
+- `run` without an explicit profile falls back to the default, then to the
+  nearest directory binding, then reports both options.
+
+Profiles can be migrated between machines with `auth export` / `auth import`.
+The export is a JSON object (`{"version": 1, "providers": {...}}`) that import
+re-serializes with private permissions. Import skips existing names unless
+`--force` is given, and reads `-` from stdin so
+`auth export | auth import -` works without an intermediate file.
+
 The Codex provider does not modify:
 
 - `config.toml`

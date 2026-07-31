@@ -10,7 +10,8 @@ from pathlib import Path
 
 from ai_auth_switch.errors import AiAuthSwitchError
 from ai_auth_switch.providers import Provider
-from ai_auth_switch.store import AuthStore, set_private_permissions, sha256_file
+from ai_auth_switch.store import AuthStore, sha256_file
+from ai_auth_switch.utils import set_private_permissions
 
 
 def _is_codex_auth_artifact(name: str) -> bool:

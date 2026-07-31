@@ -1,67 +1,18 @@
 from __future__ import annotations
 
-import base64
 import json
 import os
 import re
 import shutil
 from pathlib import Path
+from typing import Any
+
+from ai_auth_switch.utils import extract_account_id_from_jwt, extract_email_from_jwt
 
 from .base import Provider
 
 
-def _decode_jwt_payload(token: str) -> dict:
-    parts = token.split(".")
-    if len(parts) < 2:
-        return {}
-
-    payload = parts[1].replace("-", "+").replace("_", "/")
-    padding = len(payload) % 4
-    if padding == 2:
-        payload += "=="
-    elif padding == 3:
-        payload += "="
-    elif padding == 1:
-        return {}
-
-    try:
-        raw = base64.b64decode(payload)
-        decoded = json.loads(raw.decode("utf-8"))
-    except Exception:
-        return {}
-    return decoded if isinstance(decoded, dict) else {}
-
-
-def _extract_email_from_jwt(token: str) -> str | None:
-    payload = _decode_jwt_payload(token)
-    profile = payload.get("https://api.openai.com/profile")
-    if isinstance(profile, dict):
-        email = profile.get("email")
-        if isinstance(email, str) and email.strip():
-            return email.strip()
-
-    email = payload.get("email")
-    if isinstance(email, str) and email.strip():
-        return email.strip()
-    return None
-
-
-def _extract_account_id_from_jwt(token: str) -> str | None:
-    payload = _decode_jwt_payload(token)
-    for key in ("chatgpt_account_id", "account_id", "sub"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-
-    auth = payload.get("https://api.openai.com/auth")
-    if isinstance(auth, dict):
-        value = auth.get("chatgpt_account_id") or auth.get("account_id")
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
-
-
-def _read_json(path: Path) -> dict:
+def _read_json(path: Path) -> dict[str, Any]:
     try:
         parsed = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
@@ -69,7 +20,7 @@ def _read_json(path: Path) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _nested_string(data: dict, *path: str) -> str | None:
+def _nested_string(data: dict[str, Any], *path: str) -> str | None:
     current = data
     for key in path:
         if not isinstance(current, dict):
@@ -106,7 +57,9 @@ class CodexProvider(Provider):
 
     def auth_identity(self, auth_file: Path) -> str | None:
         data = _read_json(auth_file)
-        tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+        tokens = data.get("tokens")
+        if not isinstance(tokens, dict):
+            tokens = {}
 
         for candidate in (
             _nested_string(data, "email"),
@@ -121,7 +74,7 @@ class CodexProvider(Provider):
         for token_key in ("id_token", "access_token"):
             token = tokens.get(token_key)
             if isinstance(token, str):
-                email = _extract_email_from_jwt(token)
+                email = extract_email_from_jwt(token)
                 if email:
                     return f"email:{email.lower()}"
 
@@ -130,7 +83,7 @@ class CodexProvider(Provider):
             for token_key in ("id_token", "access_token"):
                 token = tokens.get(token_key)
                 if isinstance(token, str):
-                    account = _extract_account_id_from_jwt(token)
+                    account = extract_account_id_from_jwt(token)
                     if account:
                         break
         if account:
@@ -140,7 +93,9 @@ class CodexProvider(Provider):
 
     def infer_profile_name(self, auth_file: Path) -> str | None:
         data = _read_json(auth_file)
-        tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+        tokens = data.get("tokens")
+        if not isinstance(tokens, dict):
+            tokens = {}
 
         email_candidates = [
             _nested_string(data, "email"),
@@ -156,7 +111,7 @@ class CodexProvider(Provider):
         for token_key in ("id_token", "access_token"):
             token = tokens.get(token_key)
             if isinstance(token, str):
-                email = _extract_email_from_jwt(token)
+                email = extract_email_from_jwt(token)
                 if email:
                     return email
 
@@ -165,7 +120,7 @@ class CodexProvider(Provider):
             for token_key in ("id_token", "access_token"):
                 token = tokens.get(token_key)
                 if isinstance(token, str):
-                    account = _extract_account_id_from_jwt(token)
+                    account = extract_account_id_from_jwt(token)
                     if account:
                         break
 

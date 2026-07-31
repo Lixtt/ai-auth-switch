@@ -134,6 +134,7 @@ class CodexStoreTests(unittest.TestCase):
                 )
                 store.set_alias(provider, "middle", "a@example.com", ["fake-codex"])
                 store.remove(provider, "a@example.com")
+                store.sync_numbered_aliases(provider)
                 aliases = store.list_aliases()
 
             # After removing a: newest m → codex1, z → codex2.
@@ -164,6 +165,7 @@ class CodexStoreTests(unittest.TestCase):
                 store.save_current(provider, "old@example.com")
                 store.set_alias(provider, "work", "old@example.com", ["fake-codex"])
                 renamed = store.rename(provider, "old@example.com", "new@example.com")
+                store.sync_numbered_aliases(provider)
                 aliases = store.list_aliases()
 
             self.assertTrue(renamed.active)
@@ -1089,7 +1091,9 @@ class CodexStoreTests(unittest.TestCase):
 
             def fake_run(command, **kwargs):
                 calls.append((command, kwargs))
-                helper = command[2]
+                helper_path = Path(command[1])
+                self.assertEqual(helper_path.name, "hermes_codex_sync.py")
+                helper = helper_path.read_text(encoding="utf-8")
                 self.assertNotIn("codex_app_server", helper)
                 self.assertIn('set_runtime(config, "auto")', helper)
                 self.assertIn("access_token", helper)
@@ -1166,7 +1170,10 @@ class CodexStoreTests(unittest.TestCase):
 
             def fake_run(command, **kwargs):
                 calls.append(command)
-                if len(command) >= 3 and command[1] == "-c":
+                if (
+                    len(command) >= 2
+                    and Path(command[1]).name == "hermes_codex_sync.py"
+                ):
                     return mock.Mock(
                         returncode=0,
                         stdout=(
