@@ -7,18 +7,18 @@ import os
 import re
 import shutil
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from ai_auth_switch.errors import AiAuthSwitchError
 from ai_auth_switch.providers import Provider
 from ai_auth_switch.utils import atomic_write, set_private_permissions
 
-
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._@+-]+")
 RESERVED_NAMES = {"", ".", "..", "tmp", "backup", "current"}
-NUMBERED_CODEX_ALIAS_RE = re.compile(r"^codex([1-9][0-9]*)$")
+AUTOMATIC_ALIAS_PROVIDER_IDS = ("codex", "claude")
 
 
 def default_store_dir() -> Path:
@@ -42,9 +42,22 @@ def sanitize_profile_name(name: str) -> str:
     return clean
 
 
-def numbered_codex_alias_index(name: str) -> int | None:
-    match = NUMBERED_CODEX_ALIAS_RE.fullmatch(name)
+def numbered_provider_alias_index(provider_id: str, name: str) -> int | None:
+    match = re.fullmatch(rf"{re.escape(provider_id)}([1-9][0-9]*)", name)
     return int(match.group(1)) if match is not None else None
+
+
+def numbered_alias_parts(name: str) -> tuple[str, int] | None:
+    for provider_id in AUTOMATIC_ALIAS_PROVIDER_IDS:
+        index = numbered_provider_alias_index(provider_id, name)
+        if index is not None:
+            return provider_id, index
+    return None
+
+
+def numbered_codex_alias_index(name: str) -> int | None:
+    """Backward-compatible helper for existing Codex integrations/tests."""
+    return numbered_provider_alias_index("codex", name)
 
 
 def _profile_mtime_desc_key(path: Path) -> tuple[int, str]:
@@ -141,6 +154,45 @@ class AuthStore:
     def profile_path(self, provider: Provider, name: str) -> Path:
         clean = sanitize_profile_name(name)
         return self.provider_dir(provider) / f"{clean}.json"
+
+    def profile_metadata_path(self, provider: Provider, name: str) -> Path | None:
+        return provider.profile_metadata_path(self.profile_path(provider, name))
+
+    def read_profile_metadata(
+        self,
+        provider: Provider,
+        name: str,
+    ) -> dict[str, Any] | None:
+        path = self.profile_metadata_path(provider, name)
+        if path is None or not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def write_profile_metadata(
+        self,
+        provider: Provider,
+        name: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        path = self.profile_metadata_path(provider, name)
+        if path is None:
+            return
+        atomic_write(
+            path,
+            json.dumps(metadata, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        )
+
+    def export_provider_metadata(self, provider: Provider) -> dict[str, dict[str, Any]]:
+        exported: dict[str, dict[str, Any]] = {}
+        for profile in self.list_profiles(provider):
+            metadata = self.read_profile_metadata(provider, profile.name)
+            if metadata:
+                exported[profile.name] = metadata
+        return exported
 
     def read_profile_content(self, provider: Provider, name: str) -> str:
         path = self.profile_path(provider, name)
@@ -376,6 +428,9 @@ class AuthStore:
         set_private_permissions(tmp)
         os.replace(tmp, path)
         set_private_permissions(path)
+        metadata = provider.read_profile_metadata(active)
+        if metadata:
+            self.write_profile_metadata(provider, path.stem, metadata)
         self.activate(provider, path.stem, backup_existing=False)
         return ProfileInfo(name=path.stem, path=path, active=True)
 
@@ -405,6 +460,9 @@ class AuthStore:
         except OSError as exc:
             raise AiAuthSwitchError(f"failed to create auth symlink: {exc}") from exc
         os.replace(tmp, active)
+        metadata = self.read_profile_metadata(provider, path.stem)
+        if metadata:
+            provider.apply_profile_metadata(metadata)
         return ProfileInfo(name=path.stem, path=path, active=True)
 
     def remove(self, provider: Provider, name: str) -> None:
@@ -417,6 +475,9 @@ class AuthStore:
 
         aliases = self._read_aliases()
         path.unlink()
+        metadata_path = self.profile_metadata_path(provider, path.stem)
+        if metadata_path is not None and metadata_path.exists():
+            metadata_path.unlink()
         aliases = {
             alias_name: alias
             for alias_name, alias in aliases.items()
@@ -436,6 +497,17 @@ class AuthStore:
         current = self.current_profile(provider)
         os.replace(old_path, new_path)
         set_private_permissions(new_path)
+        old_metadata = provider.profile_metadata_path(old_path)
+        new_metadata = provider.profile_metadata_path(new_path)
+        if (
+            old_metadata is not None
+            and new_metadata is not None
+            and old_metadata.exists()
+        ):
+            new_metadata.parent.mkdir(parents=True, exist_ok=True)
+            set_private_permissions(new_metadata.parent)
+            os.replace(old_metadata, new_metadata)
+            set_private_permissions(new_metadata)
         renamed_aliases = {
             alias_name: (
                 AliasInfo(
@@ -460,14 +532,14 @@ class AuthStore:
         return sorted(aliases.values(), key=self._alias_sort_key)
 
     def sync_numbered_aliases(self, provider: Provider) -> list[AliasInfo]:
-        """Keep codex1, codex2, ... contiguous and aligned with saved profiles.
+        """Keep provider1, provider2, ... aligned with saved profiles.
 
         Profiles are ordered by modification time, newest first.  A newly
-        saved profile becomes ``codex1`` and existing numbered aliases shift
+        saved profile becomes ``<provider>1`` and existing numbered aliases shift
         down accordingly.  Custom per-alias commands are preserved across
         reordering.
         """
-        if provider.id != "codex":
+        if provider.id not in AUTOMATIC_ALIAS_PROVIDER_IDS:
             return []
 
         aliases = self._read_aliases()
@@ -476,7 +548,9 @@ class AuthStore:
 
         default_command = tuple(str(part) for part in provider.login_command)
         if not default_command and profile_paths:
-            raise AiAuthSwitchError("automatic Codex alias command cannot be empty")
+            raise AiAuthSwitchError(
+                f"automatic {provider.id} alias command cannot be empty"
+            )
 
         # Collect custom commands from existing numbered aliases.
         # When multiple numbered aliases map to the same profile (can happen
@@ -485,10 +559,10 @@ class AuthStore:
         custom_command: dict[str, tuple[str, ...]] = {}
         for alias in sorted(
             aliases.values(),
-            key=lambda a: numbered_codex_alias_index(a.name) or 0,
+            key=lambda a: numbered_provider_alias_index(provider.id, a.name) or 0,
         ):
             if (
-                numbered_codex_alias_index(alias.name) is None
+                numbered_provider_alias_index(provider.id, alias.name) is None
                 or alias.provider_id != provider.id
                 or alias.profile not in profile_names
             ):
@@ -499,21 +573,24 @@ class AuthStore:
             elif alias.command != default_command and existing == default_command:
                 custom_command[alias.profile] = alias.command
 
-        # Build ordered list: newest profile first → codex1.
+        # Build ordered list: newest profile first → <provider>1.
         ordered_profiles: list[tuple[str, tuple[str, ...]]] = []
         for path in profile_paths:
             command = custom_command.get(path.stem, default_command)
             ordered_profiles.append((path.stem, command))
 
-        # Keep non-numbered aliases unchanged.
+        # Keep custom and other providers' numbered aliases unchanged.
         updated = {
             name: alias
             for name, alias in aliases.items()
-            if numbered_codex_alias_index(name) is None
+            if not (
+                alias.provider_id == provider.id
+                and numbered_provider_alias_index(provider.id, name) is not None
+            )
         }
         automatic: list[AliasInfo] = []
         for index, (profile, command) in enumerate(ordered_profiles, start=1):
-            name = f"codex{index}"
+            name = f"{provider.id}{index}"
             alias = AliasInfo(
                 name=name,
                 provider_id=provider.id,
@@ -566,14 +643,14 @@ class AuthStore:
         self._write_aliases(aliases)
 
     @staticmethod
-    def _alias_sort_key(alias: AliasInfo) -> tuple[int, int | str]:
-        index = numbered_codex_alias_index(alias.name)
-        if index is not None:
-            return (0, index)
-        return (1, alias.name)
+    def _alias_sort_key(alias: AliasInfo) -> tuple[int, str, int | str]:
+        parts = numbered_alias_parts(alias.name)
+        if parts is not None and parts[0] == alias.provider_id:
+            return (0, parts[0], parts[1])
+        return (1, "", alias.name)
 
     def _profile_paths_in_initial_alias_order(self, provider: Provider) -> list[Path]:
-        """Return profile files ordered newest-first (→ codex1)."""
+        """Return profile files ordered newest-first (→ <provider>1)."""
         root = self.provider_dir(provider)
         if not root.exists():
             return []
@@ -627,6 +704,9 @@ class AuthStore:
         if path is None:
             return
         self._sync_active_back_to_profile_if_replaced(active, path)
+        metadata = provider.read_profile_metadata(active)
+        if metadata:
+            self.write_profile_metadata(provider, path.stem, metadata)
 
     def _profile_matching_active_identity(self, provider: Provider, active: Path) -> Path | None:
         try:
@@ -748,6 +828,9 @@ class AuthStore:
             )
 
         self._sync_active_back_to_profile_if_replaced(active, profile_path)
+        metadata = provider.read_profile_metadata(active)
+        if metadata:
+            self.write_profile_metadata(provider, name, metadata)
 
     def _read_aliases(self) -> dict[str, AliasInfo]:
         path = self.aliases_path()

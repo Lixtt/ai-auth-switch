@@ -54,7 +54,7 @@ class ExportImportTests(unittest.TestCase):
             # The export file is private because it contains credentials.
             self.assertEqual(export_file.stat().st_mode & 0o777, 0o600)
             payload = json.loads(export_file.read_text(encoding="utf-8"))
-            self.assertEqual(payload["version"], 1)
+            self.assertEqual(payload["version"], 2)
             self.assertEqual(
                 set(payload["providers"]["codex"]),
                 {"a@example.com", "b@example.com"},

@@ -151,6 +151,25 @@ when `~/.local/bin` is shared by multiple workers but `/usr/local` is not.
 Dependent Hermes/OpenClaw synchronization remains attached to permanent active
 auth changes. A profile-scoped run does not change those global integrations.
 
+## Claude Code Isolation
+
+On Linux, the Claude provider manages the OAuth credential file at
+`$CLAUDE_CONFIG_DIR/.credentials.json` (default `~/.claude/.credentials.json`).
+Claude Code keeps account identity separately in `.claude.json`, so a saved
+profile has a private, non-secret metadata sidecar containing the account UUID,
+email, subscription type, and rate-limit tier when available. Token-, secret-,
+and key-like metadata fields are discarded.
+
+Profile-scoped Claude runs create a temporary `CLAUDE_CONFIG_DIR`, link normal
+settings and state from the user's config directory, install only the selected
+`.credentials.json`, and copy account metadata into the isolated `.claude.json`.
+Higher-precedence environment authentication is removed in that child process.
+Credential refresh reconciliation uses the sidecar account UUID to reject a
+write-back after an in-session login to a different account.
+
+Claude Code stores credentials in the macOS Keychain on macOS. The file-based
+provider deliberately does not export or copy Keychain entries.
+
 ## Provider Boundary
 
 A provider should only define:
@@ -158,6 +177,7 @@ A provider should only define:
 - the active auth file path
 - the login command
 - how to infer a readable profile name from an auth file
+- optional non-secret identity metadata used to guard rotating credentials
 
 Providers should not own application-wide config rewriting. If a future tool
 needs provider/model/proxy switching, that should be a separate integration

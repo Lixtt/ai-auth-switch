@@ -3,8 +3,8 @@
 Switch auth profiles for AI coding agents while keeping the app's normal
 configuration, history, sessions, and cache layout unchanged.
 
-The first provider is Codex. The design keeps Codex itself as the source of
-truth for everything except the active auth file:
+Codex and Claude Code are supported. The design keeps each agent as the source
+of truth for everything except the active auth file:
 
 - `~/.codex/config.toml` is not rewritten.
 - `~/.codex/history.jsonl`, `sessions/`, `skills/`, and other Codex state stay in place.
@@ -14,6 +14,8 @@ truth for everything except the active auth file:
 - Saved profiles live outside Codex under `~/.local/share/ai-auth-switch/`.
 - Hermes and OpenClaw Codex-dependent auth state is synchronized after Codex
   auth changes.
+- Claude Code profiles isolate `.credentials.json` while sharing the normal
+  settings, history, sessions, skills, plugins, and cache layout.
 
 ## Installation
 
@@ -225,8 +227,8 @@ Temporary homes use the machine-local per-user runtime directory by default
 store do not contend on `/mnt` for per-process symlink creation and cleanup.
 Set `AI_AUTH_SWITCH_RUNTIME_DIR` to override the runtime parent when needed.
 
-Names matching `codex1`, `codex2`, and so on are reserved for automatic
-management. Other alias names can still be created manually with
+Names matching `codex1`, `codex2`, `claude1`, `claude2`, and so on are reserved
+for automatic management. Other alias names can still be created manually with
 `ai-auth-switch alias set` and `ai-auth-switch alias install`.
 
 When `--store-dir` is passed, automatic command-link installation is skipped
@@ -236,6 +238,76 @@ directory. Editable installs prefer the checkout's shared `bin/ai-auth-switch`
 launcher, which keeps aliases portable when the home directory is mounted on
 multiple machines. Set `AI_AUTH_SWITCH_ALIAS_TARGET` or pass `--target` to
 choose another launcher explicitly.
+
+## Claude Code Usage
+
+Claude Code OAuth profiles support the same save, list, switch, default,
+directory-binding, rename, remove, export, and import operations as Codex.
+On Linux, Claude Code stores OAuth credentials in
+`~/.claude/.credentials.json`; the official `CLAUDE_CONFIG_DIR` override is
+also supported.
+
+Import the currently stored Claude Code login:
+
+```bash
+ai-auth-switch auth save claude
+```
+
+The profile name is inferred from Claude Code's account metadata when an email
+is available. You can always provide an explicit name:
+
+```bash
+ai-auth-switch auth save claude work
+```
+
+Log in to another Claude account and save it without disturbing existing
+profiles:
+
+```bash
+ai-auth-switch auth login claude
+ai-auth-switch auth login claude work -- --email someone@example.com
+```
+
+List, activate, and inspect profiles:
+
+```bash
+ai-auth-switch auth list claude
+ai-auth-switch auth use claude someone@example.com
+ai-auth-switch auth current claude
+```
+
+Numbered `claude1`, `claude2`, and so on aliases are installed and maintained
+automatically. Each alias runs with a private temporary `CLAUDE_CONFIG_DIR`, so
+multiple Claude accounts can run concurrently without changing the default
+Claude login:
+
+```bash
+claude1 -p "review this repository"
+claude2 --continue
+ai-auth-switch run claude someone@example.com -- claude -p "summarize the tests"
+```
+
+The temporary config shares normal Claude Code state but isolates
+`.credentials.json` and account metadata. Refreshed OAuth credentials are
+written back to the selected profile with an account-identity check, preventing
+an accidental `/login` from overwriting another saved account.
+
+Claude Code gives environment credentials such as `ANTHROPIC_API_KEY`,
+`ANTHROPIC_AUTH_TOKEN`, and cloud-provider modes higher priority than saved
+OAuth credentials. `claudeN` and `run claude` remove those overrides in the
+child process so the selected OAuth profile wins. For permanent `auth use`
+switches, unset those variables in your shell. API-key, Bedrock, Vertex,
+Foundry, and `apiKeyHelper` profiles are not copied or managed.
+
+Use a non-default config directory when needed:
+
+```bash
+ai-auth-switch --claude-config-dir /path/to/.claude auth list claude
+```
+
+File-based Claude OAuth profile management currently targets Linux. Claude Code
+uses the encrypted macOS Keychain on macOS, which is intentionally not copied
+by this tool; Windows isolated-run support has not yet been validated.
 
 ## Directory Overrides
 
@@ -262,6 +334,9 @@ The profile store can be moved with:
 ```bash
 AI_AUTH_SWITCH_HOME=/secure/path ai-auth-switch auth list codex
 ```
+
+Claude Code's config directory can be selected with `CLAUDE_CONFIG_DIR` or the
+global `--claude-config-dir` option.
 
 ## Default Profile and Directory Binding
 
@@ -322,7 +397,8 @@ ai-auth-switch auth export | ai-auth-switch auth import -   # pipe, no file
 
 Existing profiles with the same name are skipped to avoid clobbering local
 state; pass `--force` to overwrite them. Imported profiles automatically get
-their numbered aliases (`codex1`, `codex2`, ...) on the target machine.
+their numbered aliases (`codex1`, `codex2`, `claude1`, `claude2`, ...) on the
+target machine.
 
 ## Architecture
 
@@ -330,8 +406,8 @@ their numbered aliases (`codex1`, `codex2`, ...) on the target machine.
 
 - Auth management: save, list, activate, rename, remove, and inspect profiles.
 - Dependent sync: point Hermes and OpenClaw at the active Codex CLI auth.
-- Wrapper: run a command in a profile-scoped Codex home without changing the
-  default active profile or blocking runs of other accounts.
+- Wrapper: run a command in a profile-scoped Codex or Claude config directory
+  without changing the default active profile or blocking other accounts.
 
 Provider support is intentionally small. A provider only needs to define where
 its active auth file lives, how to infer a profile name, and which login command

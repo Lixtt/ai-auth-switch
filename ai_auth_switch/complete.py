@@ -17,9 +17,13 @@ def _provider_from_ns(provider_id: str, ns: argparse.Namespace):
     from ai_auth_switch.providers import get_provider
 
     codex_home = getattr(ns, "codex_home", None)
+    claude_config_dir = getattr(ns, "claude_config_dir", None)
     return get_provider(
         provider_id,
         codex_home=Path(codex_home).expanduser() if codex_home else None,
+        claude_config_dir=(
+            Path(claude_config_dir).expanduser() if claude_config_dir else None
+        ),
     )
 
 

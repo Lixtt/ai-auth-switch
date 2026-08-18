@@ -8,9 +8,10 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NoReturn, Sequence
+from typing import NoReturn
 
 from ai_auth_switch import __version__
 from ai_auth_switch.complete import (
@@ -20,13 +21,15 @@ from ai_auth_switch.complete import (
     zsh_completion_script,
 )
 from ai_auth_switch.errors import AiAuthSwitchError
-from ai_auth_switch.providers import Provider, get_provider
+from ai_auth_switch.providers import ClaudeProvider, Provider, get_provider
+from ai_auth_switch.providers.claude import AUTH_OVERRIDE_ENV_VARS
 from ai_auth_switch.store import (
     AliasInfo,
     AuthStore,
     ProfileInfo,
     clear_binding,
-    numbered_codex_alias_index,
+    numbered_alias_parts,
+    numbered_provider_alias_index,
     read_binding,
     resolve_binding,
     sanitize_profile_name,
@@ -36,8 +39,7 @@ from ai_auth_switch.sync import SyncResult, sync_codex_dependents
 from ai_auth_switch.usage import fetch_profile_usage, format_usage, usage_to_dict
 from ai_auth_switch.wrapper import run_with_profile
 
-
-SUPPORTED_PROVIDERS = ["codex"]
+SUPPORTED_PROVIDERS = ["codex", "claude"]
 PROGRAM_NAMES = {
     "ai-auth-switch",
     "ais",
@@ -105,7 +107,16 @@ def _strip_separator(args: Sequence[str]) -> list[str]:
 
 def _provider_from_args(args: argparse.Namespace) -> Provider:
     codex_home = Path(args.codex_home).expanduser() if args.codex_home else None
-    return get_provider(args.provider, codex_home=codex_home)
+    claude_config_dir = (
+        Path(args.claude_config_dir).expanduser()
+        if args.claude_config_dir
+        else None
+    )
+    return get_provider(
+        args.provider,
+        codex_home=codex_home,
+        claude_config_dir=claude_config_dir,
+    )
 
 
 def _store_from_args(args: argparse.Namespace) -> AuthStore:
@@ -121,7 +132,16 @@ def _provider_ids(args: argparse.Namespace) -> list[str]:
 
 def _provider_by_id(provider_id: str, args: argparse.Namespace) -> Provider:
     codex_home = Path(args.codex_home).expanduser() if args.codex_home else None
-    return get_provider(provider_id, codex_home=codex_home)
+    claude_config_dir = (
+        Path(args.claude_config_dir).expanduser()
+        if args.claude_config_dir
+        else None
+    )
+    return get_provider(
+        provider_id,
+        codex_home=codex_home,
+        claude_config_dir=claude_config_dir,
+    )
 
 
 def _alias_executable_target(target: str | Path | None = None) -> Path:
@@ -179,14 +199,15 @@ def _replace_symlink(link: Path, target: Path) -> None:
 def _sync_numbered_alias_executables(
     aliases: Sequence[AliasInfo],
     *,
+    provider_id: str,
     bin_dir: Path,
     target: Path,
 ) -> AliasLinkSyncResult:
     automatic = {
         alias.name: alias
         for alias in aliases
-        if alias.provider_id == "codex"
-        and numbered_codex_alias_index(alias.name) is not None
+        if alias.provider_id == provider_id
+        and numbered_provider_alias_index(provider_id, alias.name) is not None
     }
     try:
         bin_dir.mkdir(parents=True, exist_ok=True)
@@ -197,7 +218,10 @@ def _sync_numbered_alias_executables(
     updated: list[Path] = []
     removed: list[Path] = []
     conflicts: list[Path] = []
-    for name in sorted(automatic, key=lambda item: numbered_codex_alias_index(item) or 0):
+    for name in sorted(
+        automatic,
+        key=lambda item: numbered_provider_alias_index(provider_id, item) or 0,
+    ):
         link = bin_dir / name
         if not link.exists() and not link.is_symlink():
             try:
@@ -225,7 +249,7 @@ def _sync_numbered_alias_executables(
         raise AiAuthSwitchError(f"failed to inspect alias directory {bin_dir}: {exc}") from exc
     for link in candidates:
         if (
-            numbered_codex_alias_index(link.name) is not None
+            numbered_provider_alias_index(provider_id, link.name) is not None
             and link.name not in automatic
             and (
                 _symlink_points_to(link, target)
@@ -312,6 +336,8 @@ def _ensure_builtin_shortcut(
 def _sync_automatic_alias_links(
     args: argparse.Namespace,
     aliases: Sequence[AliasInfo],
+    *,
+    provider_id: str,
 ) -> None:
     bin_dir = _automatic_alias_bin_dir(args)
     if bin_dir is None:
@@ -320,6 +346,7 @@ def _sync_automatic_alias_links(
     try:
         result = _sync_numbered_alias_executables(
             aliases,
+            provider_id=provider_id,
             bin_dir=bin_dir,
             target=target,
         )
@@ -337,16 +364,21 @@ def _profile_sort_key(
 ) -> tuple[int, int | str]:
     alias_name = aliases_by_profile.get(profile.name)
     if alias_name is not None:
-        return (0, numbered_codex_alias_index(alias_name) or 0)
+        parts = numbered_alias_parts(alias_name)
+        return (0, parts[1] if parts is not None else 0)
     return (1, profile.name)
 
 
 def _auth_hint(provider: Provider) -> str:
     active = provider.active_auth_path
     if not active.exists() and not active.is_symlink():
+        if provider.id == "claude":
+            override = "set CLAUDE_CONFIG_DIR or pass --claude-config-dir"
+        else:
+            override = "set CODEX_HOME or pass --codex-home"
         return (
-            f"auth file not found at {active}; set CODEX_HOME or pass "
-            f"--codex-home if {provider.id} uses another config directory"
+            f"auth file not found at {active}; {override} if {provider.id} "
+            "uses another config directory"
         )
 
     inferred = provider.infer_profile_name(active)
@@ -375,6 +407,17 @@ def _sync_after_auth_change(
     profile_name: str | None = None,
     hermes_login: bool = False,
 ) -> list[SyncResult]:
+    if provider.id == "claude":
+        overrides = [name for name in AUTH_OVERRIDE_ENV_VARS if os.environ.get(name)]
+        if overrides:
+            print(
+                "ai-auth-switch: warning: Claude environment authentication "
+                f"overrides the active OAuth profile: {', '.join(overrides)}; "
+                "unset it for permanent switching, or use claudeN/`run claude` "
+                "which isolates these variables",
+                file=sys.stderr,
+            )
+        return []
     if provider.id != "codex" or getattr(args, "no_dependent_sync", False):
         return []
     try:
@@ -414,7 +457,7 @@ def _cmd_auth_list(args: argparse.Namespace) -> int:
             alias.profile: alias.name
             for alias in aliases
             if alias.provider_id == provider.id
-            and numbered_codex_alias_index(alias.name) is not None
+            and numbered_provider_alias_index(provider.id, alias.name) is not None
         }
         profiles = sorted(
             profiles,
@@ -596,9 +639,15 @@ def _cmd_auth_export(args: argparse.Namespace) -> int:
     store = _store_from_args(args)
     provider_ids = _provider_ids(args)
     payload = {
-        "version": 1,
+        "version": 2,
         "providers": {
             provider_id: store.export_provider_profiles(
+                _provider_by_id(provider_id, args)
+            )
+            for provider_id in provider_ids
+        },
+        "profile_metadata": {
+            provider_id: store.export_provider_metadata(
                 _provider_by_id(provider_id, args)
             )
             for provider_id in provider_ids
@@ -646,6 +695,9 @@ def _cmd_auth_import(args: argparse.Namespace) -> int:
     providers_data = data.get("providers")
     if not isinstance(providers_data, dict):
         raise AiAuthSwitchError(f"missing 'providers' object in {source}")
+    all_metadata = data.get("profile_metadata")
+    if not isinstance(all_metadata, dict):
+        all_metadata = {}
 
     total_imported = 0
     total_skipped = 0
@@ -666,8 +718,18 @@ def _cmd_auth_import(args: argparse.Namespace) -> int:
                 profiles,
                 force=args.force,
             )
+            provider_metadata = all_metadata.get(provider_id)
+            if isinstance(provider_metadata, dict):
+                for name in imported:
+                    metadata = provider_metadata.get(name)
+                    if isinstance(metadata, dict):
+                        store.write_profile_metadata(provider, name, metadata)
             automatic_aliases = store.sync_numbered_aliases(provider)
-            _sync_automatic_alias_links(args, automatic_aliases)
+            _sync_automatic_alias_links(
+                args,
+                automatic_aliases,
+                provider_id=provider.id,
+            )
         for name in imported:
             print(f"imported {provider_id} profile {name}")
         for name in skipped:
@@ -685,7 +747,7 @@ def _cmd_auth_save(args: argparse.Namespace) -> int:
     with store.lock():
         profile = store.save_current(provider, args.name)
         automatic_aliases = store.sync_numbered_aliases(provider)
-        _sync_automatic_alias_links(args, automatic_aliases)
+        _sync_automatic_alias_links(args, automatic_aliases, provider_id=provider.id)
     print(f"saved {provider.id} auth as {profile.name}")
     print(f"active {provider.id} auth -> {profile.path}")
     _sync_after_auth_change(args, provider, store, profile_name=profile.name)
@@ -698,7 +760,7 @@ def _cmd_auth_use(args: argparse.Namespace) -> int:
     with store.lock():
         profile = store.activate(provider, args.name)
         automatic_aliases = store.sync_numbered_aliases(provider)
-        _sync_automatic_alias_links(args, automatic_aliases)
+        _sync_automatic_alias_links(args, automatic_aliases, provider_id=provider.id)
     print(f"active {provider.id} auth -> {profile.name}")
     _sync_after_auth_change(args, provider, store, profile_name=profile.name)
     return 0
@@ -706,6 +768,9 @@ def _cmd_auth_use(args: argparse.Namespace) -> int:
 
 def _cmd_auth_sync(args: argparse.Namespace) -> int:
     provider = _provider_from_args(args)
+    if provider.id != "codex":
+        print(f"no dependent auth sync is configured for {provider.id}")
+        return 0
     store = _store_from_args(args)
     current = store.current_profile(provider)
     results = sync_codex_dependents(
@@ -728,7 +793,7 @@ def _cmd_auth_remove(args: argparse.Namespace) -> int:
     with store.lock():
         store.remove(provider, args.name)
         automatic_aliases = store.sync_numbered_aliases(provider)
-        _sync_automatic_alias_links(args, automatic_aliases)
+        _sync_automatic_alias_links(args, automatic_aliases, provider_id=provider.id)
     print(f"removed {provider.id} profile {args.name}")
     return 0
 
@@ -739,13 +804,24 @@ def _cmd_auth_rename(args: argparse.Namespace) -> int:
     with store.lock():
         profile = store.rename(provider, args.old, args.new)
         automatic_aliases = store.sync_numbered_aliases(provider)
-        _sync_automatic_alias_links(args, automatic_aliases)
+        _sync_automatic_alias_links(args, automatic_aliases, provider_id=provider.id)
     print(f"renamed {provider.id} profile {args.old} -> {profile.name}")
     return 0
 
 
 def _run_login(provider: Provider, login_args: Sequence[str]) -> int:
-    command = list(provider.login_command) + ["login"] + _strip_separator(login_args)
+    command = (
+        list(provider.login_command)
+        + list(provider.login_args)
+        + _strip_separator(login_args)
+    )
+    if isinstance(provider, ClaudeProvider):
+        env = os.environ.copy()
+        for name in AUTH_OVERRIDE_ENV_VARS:
+            env.pop(name, None)
+        if provider.explicit_config_dir:
+            env["CLAUDE_CONFIG_DIR"] = str(provider.config_dir)
+        return subprocess.call(command, env=env)
     return subprocess.call(command)
 
 
@@ -756,9 +832,20 @@ def _cmd_auth_login(args: argparse.Namespace) -> int:
     active = provider.active_auth_path
     backup = active.with_name(f".{active.name}.login-backup.{os.getpid()}.{time.time_ns()}")
     had_active = False
+    state_path = provider.config_state_path if isinstance(provider, ClaudeProvider) else None
+    state_backup = (
+        state_path.with_name(
+            f".{state_path.name}.login-backup.{os.getpid()}.{time.time_ns()}"
+        )
+        if state_path is not None
+        else None
+    )
+    had_state = bool(state_path is not None and state_path.is_file())
 
     with store.lock():
         active.parent.mkdir(parents=True, exist_ok=True)
+        if had_state and state_path is not None and state_backup is not None:
+            shutil.copy2(state_path, state_backup)
         if active.exists() or active.is_symlink():
             os.replace(active, backup)
             had_active = True
@@ -769,6 +856,10 @@ def _cmd_auth_login(args: argparse.Namespace) -> int:
                 active.unlink()
             if had_active:
                 os.replace(backup, active)
+            if had_state and state_path is not None and state_backup is not None:
+                os.replace(state_backup, state_path)
+            elif state_path is not None and state_path.exists():
+                state_path.unlink()
             return status
 
         try:
@@ -778,13 +869,19 @@ def _cmd_auth_login(args: argparse.Namespace) -> int:
                 active.unlink()
             if had_active:
                 os.replace(backup, active)
+            if had_state and state_path is not None and state_backup is not None:
+                os.replace(state_backup, state_path)
+            elif state_path is not None and state_path.exists():
+                state_path.unlink()
             raise
 
         if had_active and backup.exists():
             backup.unlink()
+        if state_backup is not None and state_backup.exists():
+            state_backup.unlink()
 
         automatic_aliases = store.sync_numbered_aliases(provider)
-        _sync_automatic_alias_links(args, automatic_aliases)
+        _sync_automatic_alias_links(args, automatic_aliases, provider_id=provider.id)
     print(f"saved {provider.id} login as {profile.name}")
     print(f"active {provider.id} auth -> {profile.path}")
     _sync_after_auth_change(
@@ -871,15 +968,16 @@ def _cmd_alias_set(args: argparse.Namespace) -> int:
         alias = store.set_alias(provider, args.name, args.profile, command or None)
         automatic_aliases = store.sync_numbered_aliases(provider)
         alias = store.resolve_alias(alias.name) or alias
-        _sync_automatic_alias_links(args, automatic_aliases)
+        _sync_automatic_alias_links(args, automatic_aliases, provider_id=provider.id)
     print(f"saved alias {_alias_display(alias)}")
     return 0
 
 
 def _cmd_alias_remove(args: argparse.Namespace) -> int:
-    if numbered_codex_alias_index(args.name) is not None:
+    parts = numbered_alias_parts(args.name)
+    if parts is not None:
         raise AiAuthSwitchError(
-            f"{args.name} is managed automatically; remove its Codex profile instead"
+            f"{args.name} is managed automatically; remove its {parts[0]} profile instead"
         )
     store = _store_from_args(args)
     with store.lock():
@@ -900,6 +998,7 @@ def _cmd_alias_sync(args: argparse.Namespace) -> int:
         )
         result = _sync_numbered_alias_executables(
             aliases,
+            provider_id=provider.id,
             bin_dir=bin_dir,
             target=_alias_executable_target(args.target),
         )
@@ -975,7 +1074,7 @@ def _maybe_run_program_alias(
     if alias is None:
         raise AiAuthSwitchError(
             f"alias not found for executable {alias_name!r}; "
-            f"run `ai-auth-switch alias set {alias_name} codex <profile>` first"
+            f"run `ai-auth-switch alias set {alias_name} <provider> <profile>` first"
         )
     return _run_alias(store, alias, argv)
 
@@ -1010,6 +1109,10 @@ def build_parser(
     parser.add_argument(
         "--codex-home",
         help="Override Codex config directory for the codex provider.",
+    )
+    parser.add_argument(
+        "--claude-config-dir",
+        help="Override Claude Code config directory for the claude provider.",
     )
     parser.add_argument(
         "--no-dependent-sync",
@@ -1194,7 +1297,7 @@ def build_parser(
 
     run = subparsers.add_parser(
         "run",
-        help="Run a command with isolated auth while sharing normal Codex state.",
+        help="Run a command with isolated auth while sharing provider state.",
     )
     run.add_argument("provider", nargs=opt(None), choices=SUPPORTED_PROVIDERS)
     run.add_argument(
@@ -1216,7 +1319,7 @@ def build_parser(
 
     alias_sync = alias_sub.add_parser(
         "sync",
-        help="Create and install contiguous codex1, codex2, ... aliases.",
+        help="Create and install contiguous provider1, provider2, ... aliases.",
     )
     alias_sync.add_argument("provider", nargs=opt(None), choices=SUPPORTED_PROVIDERS)
     alias_sync.add_argument("--bin-dir", help="Directory for automatic alias symlinks.")
@@ -1224,7 +1327,11 @@ def build_parser(
     alias_sync.set_defaults(func=_cmd_alias_sync)
 
     alias_set = alias_sub.add_parser("set", help="Create or update a command alias.")
-    alias_set.add_argument("name", nargs=opt(None), help="Alias executable name, for example codex1.")
+    alias_set.add_argument(
+        "name",
+        nargs=opt(None),
+        help="Alias executable name, for example codex-work or claude-work.",
+    )
     alias_set.add_argument("provider", nargs=opt(None), choices=SUPPORTED_PROVIDERS)
     alias_set.add_argument("profile", nargs=opt(None), help="Saved provider profile to activate.")
     alias_set.add_argument(
