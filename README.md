@@ -15,32 +15,31 @@ truth for everything except the active auth file:
 - Hermes and OpenClaw Codex-dependent auth state is synchronized after Codex
   auth changes.
 
-## Install From Checkout
+## Installation
+
+Install or upgrade the latest stable release from PyPI:
 
 ```bash
-python -m pip install -e .
+python -m pip install --upgrade ai-auth-switch
 ```
 
 Python 3.10 or newer is required.
 
-You can also run without installation:
+To install the newest source directly from the official GitHub repository:
 
 ```bash
-./bin/ai-auth-switch --help
-./bin/ais --help
+python -m pip install --upgrade "ai-auth-switch @ git+https://github.com/Lixtt/ai-auth-switch.git"
 ```
 
 `ais` is the short command name for `ai-auth-switch`; both accept exactly the
 same arguments. Examples below use the long name for clarity.
 
-If the checkout and home directory are shared by multiple machines but
-`/usr/local` is machine-local, install the shared launcher on `PATH` instead:
+For development, clone the official repository and use an editable install:
 
 ```bash
-mkdir -p ~/.local/bin
-ln -sfn "$PWD/bin/ai-auth-switch" ~/.local/bin/ai-auth-switch
-hash -r
-ai-auth-switch alias sync codex
+git clone https://github.com/Lixtt/ai-auth-switch.git
+cd ai-auth-switch
+python -m pip install -e .
 ```
 
 ## Codex Usage
