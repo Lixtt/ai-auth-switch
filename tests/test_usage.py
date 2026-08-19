@@ -12,6 +12,7 @@ from unittest import mock
 
 from ai_auth_switch.usage import (
     AccountUsage,
+    UsageWindow,
     fetch_profile_usage,
     fetch_usage,
     format_usage,
@@ -20,7 +21,9 @@ from ai_auth_switch.usage import (
 
 
 def fake_jwt(payload: dict) -> str:
-    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    encoded = (
+        base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    )
     return f"header.{encoded}.signature"
 
 
@@ -59,7 +62,7 @@ class UsageTests(unittest.TestCase):
                             "primary_window": {
                                 "used_percent": 28,
                                 "limit_window_seconds": 18000,
-                                "reset_at": 123,
+                                "reset_at": 1_800_000_000,
                             }
                         },
                     }
@@ -69,7 +72,37 @@ class UsageTests(unittest.TestCase):
             self.assertEqual(seen["authorization"], f"Bearer {token}")
             self.assertEqual(seen["account"], "acc-1")
             self.assertEqual(seen["timeout"], 2.5)
-            self.assertEqual(format_usage(usage), "plus, 5h 72% left")
+            self.assertEqual(
+                format_usage(usage, now=1_799_996_275),
+                "plus, 5h 72% left, resets 2027-01-15T08:00:00Z (in 1h 2m)",
+            )
+
+    def test_format_usage_shows_each_window_reset_time(self) -> None:
+        usage = AccountUsage(
+            plan_type="plus",
+            primary=UsageWindow(
+                used_percent=28, window_seconds=18_000, resets_at=1_800_000_000
+            ),
+            secondary=UsageWindow(
+                used_percent=59,
+                window_seconds=604_800,
+                resets_at=1_800_086_400,
+            ),
+        )
+        self.assertEqual(
+            format_usage(usage, now=1_799_996_275),
+            "plus, 5h 72% left, resets 2027-01-15T08:00:00Z (in 1h 2m), "
+            "168h 41% left, resets 2027-01-16T08:00:00Z (in 1d 1h)",
+        )
+
+    def test_usage_json_includes_machine_and_display_reset_times(self) -> None:
+        from ai_auth_switch.usage import usage_to_dict
+
+        payload = usage_to_dict(
+            AccountUsage(primary=UsageWindow(used_percent=1, resets_at=1_800_000_000))
+        )
+        self.assertEqual(payload["primary"]["resets_at"], 1_800_000_000)
+        self.assertEqual(payload["primary"]["resets_at_iso"], "2027-01-15T08:00:00Z")
 
     def test_parse_usage_supports_two_windows_and_credits(self) -> None:
         usage = parse_usage(
@@ -140,10 +173,22 @@ class UsageTests(unittest.TestCase):
             profile_dir = root / "store" / "profiles" / "codex"
             profile_dir.mkdir(parents=True)
             (profile_dir / "one.json").write_text("{}")
-            with mock.patch(
-                "ai_auth_switch.cli.fetch_profile_usage",
-                return_value={"one": AccountUsage(plan_type="plus")},
-            ), mock.patch("builtins.print") as output:
+            with (
+                mock.patch(
+                    "ai_auth_switch.cli.fetch_profile_usage",
+                    return_value={
+                        "one": AccountUsage(
+                            plan_type="plus",
+                            primary=UsageWindow(
+                                used_percent=28,
+                                window_seconds=18_000,
+                                resets_at=1_800_000_000,
+                            ),
+                        )
+                    },
+                ),
+                mock.patch("builtins.print") as output,
+            ):
                 status = main(
                     [
                         "--store-dir",
@@ -157,7 +202,12 @@ class UsageTests(unittest.TestCase):
                     ]
                 )
             self.assertEqual(status, 0)
-            self.assertTrue(any("(plus)" in str(call) for call in output.call_args_list))
+            self.assertTrue(
+                any(
+                    "resets 2027-01-15T08:00:00Z" in str(call)
+                    for call in output.call_args_list
+                )
+            )
 
     def test_cli_list_json_is_structured_and_does_not_expose_paths(self) -> None:
         from ai_auth_switch.cli import main
@@ -168,10 +218,13 @@ class UsageTests(unittest.TestCase):
             profile_dir.mkdir(parents=True)
             (profile_dir / "one.json").write_text('{"email":"one"}')
             output = io.StringIO()
-            with mock.patch(
-                "ai_auth_switch.cli.fetch_profile_usage",
-                return_value={"one": AccountUsage(plan_type="pro")},
-            ), contextlib.redirect_stdout(output):
+            with (
+                mock.patch(
+                    "ai_auth_switch.cli.fetch_profile_usage",
+                    return_value={"one": AccountUsage(plan_type="pro")},
+                ),
+                contextlib.redirect_stdout(output),
+            ):
                 status = main(
                     [
                         "--store-dir",

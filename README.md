@@ -85,9 +85,13 @@ saved account. The normal list remains local and instant; usage lookup is
 opt-in because it requires network access and may report an expired login.
 
 ```text
-* someone@example.com [codex1] (plus, 5h 72% left, 168h 41% left)
-  other@example.com [codex2] (team, 5h 18% left, 168h 83% left)
+* someone@example.com [codex1] (plus, 5h 72% left, resets 2026-08-19T12:30:00Z (in 2h 5m), 168h 41% left, resets 2026-08-25T10:00:00Z (in 6d 23h))
+  other@example.com [codex2] (team, 5h 18% left, resets 2026-08-19T11:15:00Z (in 50m), 168h 83% left, resets 2026-08-24T10:00:00Z (in 5d 23h))
 ```
+
+Each rate-limit window shows its next reset as an absolute UTC timestamp and a
+relative countdown. JSON output keeps the Unix `resets_at` value and also adds
+an ISO 8601 `resets_at_iso` value for direct display.
 
 Results are cached for 60 seconds. Use `--refresh-usage` to bypass the cache,
 `--usage-cache-ttl` to tune it, `--usage-timeout` for slow networks, and

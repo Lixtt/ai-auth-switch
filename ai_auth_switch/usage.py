@@ -7,12 +7,12 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from ai_auth_switch import __version__
 from ai_auth_switch.utils import atomic_write, extract_account_id_from_jwt
-
 
 DEFAULT_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 
@@ -85,10 +85,14 @@ def parse_usage(data: object) -> AccountUsage:
     credits = credits if isinstance(credits, dict) else {}
     balance = credits.get("balance")
     return AccountUsage(
-        plan_type=data.get("plan_type") if isinstance(data.get("plan_type"), str) else None,
+        plan_type=data.get("plan_type")
+        if isinstance(data.get("plan_type"), str)
+        else None,
         primary=_window(limits.get("primary_window")),
         secondary=_window(limits.get("secondary_window")),
-        credits_balance=str(balance) if isinstance(balance, (str, int, float)) else None,
+        credits_balance=str(balance)
+        if isinstance(balance, (str, int, float))
+        else None,
         credits_unlimited=credits.get("unlimited") is True,
     )
 
@@ -149,7 +153,9 @@ def fetch_profile_usage(
             pending_items.append((name, path))
     if not pending_items:
         return results
-    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(pending_items)))) as pool:
+    with ThreadPoolExecutor(
+        max_workers=max(1, min(workers, len(pending_items)))
+    ) as pool:
         pending = {
             pool.submit(fetcher, path, timeout=timeout): (name, path)
             for name, path in pending_items
@@ -223,6 +229,7 @@ def _window_to_dict(window: UsageWindow | None) -> dict[str, Any] | None:
         "used_percent": window.used_percent,
         "window_seconds": window.window_seconds,
         "resets_at": window.resets_at,
+        "resets_at_iso": _reset_at_iso(window.resets_at),
     }
 
 
@@ -260,17 +267,61 @@ def _usage_from_dict(data: object) -> AccountUsage:
     )
 
 
-def format_window(window: UsageWindow) -> str:
+def _reset_at_iso(resets_at: int | None) -> str | None:
+    if resets_at is None:
+        return None
+    try:
+        return (
+            datetime.fromtimestamp(resets_at, tz=timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _remaining_time(seconds: float) -> str:
+    if seconds <= 0:
+        return "due"
+    total_minutes = int(seconds // 60)
+    if total_minutes < 1:
+        return "in <1m"
+    days, remainder = divmod(total_minutes, 24 * 60)
+    hours, minutes = divmod(remainder, 60)
+    if days:
+        detail = f"{days}d"
+        if hours:
+            detail += f" {hours}h"
+    elif hours:
+        detail = f"{hours}h"
+        if minutes:
+            detail += f" {minutes}m"
+    else:
+        detail = f"{minutes}m"
+    return f"in {detail}"
+
+
+def format_reset_time(resets_at: int | None, *, now: float | None = None) -> str | None:
+    reset_iso = _reset_at_iso(resets_at)
+    if reset_iso is None or resets_at is None:
+        return None
+    current = time.time() if now is None else now
+    return f"resets {reset_iso} ({_remaining_time(resets_at - current)})"
+
+
+def format_window(window: UsageWindow, *, now: float | None = None) -> str:
     if window.window_seconds and window.window_seconds % 3600 == 0:
         label = f"{window.window_seconds // 3600}h"
     elif window.window_seconds and window.window_seconds % 60 == 0:
         label = f"{window.window_seconds // 60}m"
     else:
         label = "window"
-    return f"{label} {window.remaining_percent:g}% left"
+    rendered = f"{label} {window.remaining_percent:g}% left"
+    reset = format_reset_time(window.resets_at, now=now)
+    return f"{rendered}, {reset}" if reset else rendered
 
 
-def format_usage(usage: AccountUsage) -> str:
+def format_usage(usage: AccountUsage, *, now: float | None = None) -> str:
     if usage.error:
         return f"usage unavailable: {usage.error}"
     parts = []
@@ -278,7 +329,7 @@ def format_usage(usage: AccountUsage) -> str:
         parts.append(usage.plan_type)
     for window in (usage.primary, usage.secondary):
         if window:
-            parts.append(format_window(window))
+            parts.append(format_window(window, now=now))
     if usage.credits_unlimited:
         parts.append("credits unlimited")
     elif usage.credits_balance is not None:
