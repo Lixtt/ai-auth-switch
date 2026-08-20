@@ -85,13 +85,14 @@ saved account. The normal list remains local and instant; usage lookup is
 opt-in because it requires network access and may report an expired login.
 
 ```text
-* someone@example.com [codex1] (plus, 5h 72% left, resets 2026-08-19T12:30:00Z (in 2h 5m), 168h 41% left, resets 2026-08-25T10:00:00Z (in 6d 23h))
-  other@example.com [codex2] (team, 5h 18% left, resets 2026-08-19T11:15:00Z (in 50m), 168h 83% left, resets 2026-08-24T10:00:00Z (in 5d 23h))
+* someone@example.com [codex1] (plus, 5h 72% left, resets 2026-08-19T20:30:00+08:00 (in 2h 5m), 168h 41% left, resets 2026-08-26T06:00:00+08:00 (in 6d 23h))
+  other@example.com [codex2] (team, 5h 18% left, resets 2026-08-19T19:15:00+08:00 (in 50m), 168h 83% left, resets 2026-08-25T18:00:00+08:00 (in 5d 23h))
 ```
 
-Each rate-limit window shows its next reset as an absolute UTC timestamp and a
-relative countdown. JSON output keeps the Unix `resets_at` value and also adds
-an ISO 8601 `resets_at_iso` value for direct display.
+Each rate-limit window shows its next reset in the local system timezone,
+including its UTC offset, together with a relative countdown. JSON output keeps
+the Unix `resets_at` value and also adds an ISO 8601 UTC `resets_at_iso` value
+for stable programmatic use.
 
 Results are cached for 60 seconds. Use `--refresh-usage` to bypass the cache,
 `--usage-cache-ttl` to tune it, `--usage-timeout` for slow networks, and
@@ -107,6 +108,95 @@ when `--usage` is also present:
 ```bash
 ai-auth-switch auth list codex --usage --json
 ```
+
+### Automatic Codex profile selection for CLI runs
+
+Use `--auto` when starting Codex from a terminal to choose a saved account by
+current quota instead of naming a profile:
+
+```bash
+ais run codex --auto
+```
+
+This runs the normal `codex` command with an isolated selected profile. To pass
+an explicit child command or Codex arguments, place them after `--`:
+
+```bash
+ais run codex --auto -- codex -C ~/workspace/project
+```
+
+Automatic runs always exclude Free-plan profiles, as well as profiles whose
+usage lookup reports expired authentication or no remaining quota. Selection
+uses the lowest remaining percentage across returned rate-limit windows. It
+also records a process lease for each running `--auto` command and divides
+available capacity by the number of active leases, so several tasks started
+together spread across accounts without changing the globally active desktop
+account. The lease is removed when the child command exits; stale leases from
+killed processes are pruned on the next selection.
+
+Usage results are cached for 60 seconds by default. Tune or bypass that cache
+when needed:
+
+```bash
+ais run codex --auto \
+  --auto-usage-cache-ttl 15 \
+  --auto-refresh-usage
+```
+
+`run --auto` is process-scoped and is intended for terminal tasks. ChatGPT
+Desktop continues to use its globally active account; use the desktop idle
+rotation feature below for that application.
+
+### ChatGPT Desktop idle account rotation (Linux)
+
+ChatGPT Desktop normally keeps one Codex app-server and one active account in
+memory. Changing `auth.json` alone therefore does not reliably update a running
+desktop session. On supported Linux desktop builds, install the managed-daemon
+integration once:
+
+```bash
+ais desktop auto install
+```
+
+Then fully close and reopen ChatGPT Desktop once. The installer starts a local
+managed app-server, adds a per-user `chatgpt.desktop` launcher override with
+`CODEX_APP_SERVER_USE_LOCAL_DAEMON=1`, and enables a systemd user service. It
+does not rewrite `~/.codex/config.toml`.
+
+The worker polls app-server thread state and never switches while a turn is
+active. After 60 continuous idle seconds, it queries every saved Codex
+profile, excludes Free-plan, expired, or exhausted accounts, and switches only
+when the current account has 10% or less remaining and another account improves
+that by at least 5 percentage points. A 30-minute cooldown prevents flapping. The
+worker checks for active turns again immediately before switching; if daemon
+restart fails, it restores the previous profile.
+
+```bash
+ais desktop auto status
+ais desktop auto status --json
+ais desktop rotate --now
+ais desktop auto disable
+```
+
+`desktop rotate --now` ignores the quota threshold and cooldown, but still
+refuses to interrupt active desktop work. `desktop auto disable` restores a
+pre-existing per-user ChatGPT launcher when one was present. Both install and
+disable require one subsequent desktop restart to change connection mode.
+
+Tune the policy during installation when needed:
+
+```bash
+ais desktop auto install \
+  --idle-seconds 90 \
+  --cooldown-seconds 3600 \
+  --switch-below 15 \
+  --min-improvement 10
+```
+
+This is global idle rotation, not per-thread account assignment. All turns in
+one desktop app-server still share the selected account. The integration uses
+the app-server Unix-socket transport documented by OpenAI and requires a
+desktop build that exposes local-daemon mode.
 
 After Codex auth is saved, logged in, or switched, `ai-auth-switch` also syncs
 Codex-dependent local tools:

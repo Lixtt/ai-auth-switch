@@ -7,6 +7,7 @@ import json
 import tempfile
 import time
 import unittest
+from datetime import timezone
 from pathlib import Path
 from unittest import mock
 
@@ -73,7 +74,7 @@ class UsageTests(unittest.TestCase):
             self.assertEqual(seen["account"], "acc-1")
             self.assertEqual(seen["timeout"], 2.5)
             self.assertEqual(
-                format_usage(usage, now=1_799_996_275),
+                format_usage(usage, now=1_799_996_275, tz=timezone.utc),
                 "plus, 5h 72% left, resets 2027-01-15T08:00:00Z (in 1h 2m)",
             )
 
@@ -90,7 +91,7 @@ class UsageTests(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            format_usage(usage, now=1_799_996_275),
+            format_usage(usage, now=1_799_996_275, tz=timezone.utc),
             "plus, 5h 72% left, resets 2027-01-15T08:00:00Z (in 1h 2m), "
             "168h 41% left, resets 2027-01-16T08:00:00Z (in 1d 1h)",
         )
@@ -203,10 +204,7 @@ class UsageTests(unittest.TestCase):
                 )
             self.assertEqual(status, 0)
             self.assertTrue(
-                any(
-                    "resets 2027-01-15T08:00:00Z" in str(call)
-                    for call in output.call_args_list
-                )
+                any("resets 2027-01-15T" in str(call) for call in output.call_args_list)
             )
 
     def test_cli_list_json_is_structured_and_does_not_expose_paths(self) -> None:

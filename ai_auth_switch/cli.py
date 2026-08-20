@@ -51,6 +51,12 @@ PROGRAM_NAMES = {
 }
 AUTO_ALIAS_BIN_DIR_ENV = "AI_AUTH_SWITCH_ALIAS_BIN_DIR"
 AUTO_ALIAS_TARGET_ENV = "AI_AUTH_SWITCH_ALIAS_TARGET"
+RUN_AUTO_FLAG_OPTIONS = {"--auto", "--auto-refresh-usage"}
+RUN_AUTO_VALUE_OPTIONS = {
+    "--auto-usage-timeout",
+    "--auto-usage-workers",
+    "--auto-usage-cache-ttl",
+}
 
 
 class CliUsageError(Exception):
@@ -90,6 +96,13 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _nonnegative_float(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return parsed
+
+
 @dataclass(frozen=True)
 class AliasLinkSyncResult:
     installed: tuple[Path, ...] = ()
@@ -103,6 +116,44 @@ def _strip_separator(args: Sequence[str]) -> list[str]:
     if args and args[0] == "--":
         return args[1:]
     return args
+
+
+def _normalize_run_auto_options(argv: Sequence[str]) -> list[str]:
+    args = list(argv)
+    try:
+        run_index = args.index("run")
+    except ValueError:
+        return args
+    tail = args[run_index + 1 :]
+    try:
+        separator_index = tail.index("--")
+    except ValueError:
+        separator_index = len(tail)
+    before_command = tail[:separator_index]
+    command = tail[separator_index:]
+    moved = []
+    kept = []
+    index = 0
+    while index < len(before_command):
+        token = before_command[index]
+        if token in RUN_AUTO_FLAG_OPTIONS:
+            moved.append(token)
+            index += 1
+            continue
+        if token in RUN_AUTO_VALUE_OPTIONS:
+            moved.append(token)
+            index += 1
+            if index < len(before_command):
+                moved.append(before_command[index])
+                index += 1
+            continue
+        if any(token.startswith(f"{option}=") for option in RUN_AUTO_VALUE_OPTIONS):
+            moved.append(token)
+            index += 1
+            continue
+        kept.append(token)
+        index += 1
+    return args[: run_index + 1] + moved + kept + command
 
 
 def _provider_from_args(args: argparse.Namespace) -> Provider:
@@ -908,9 +959,35 @@ def _split_login_name_and_args(raw: Sequence[str]) -> tuple[str | None, list[str
 def _cmd_run(args: argparse.Namespace) -> int:
     provider = _provider_from_args(args)
     store = _store_from_args(args)
-    command = _strip_separator(args.command)
+    command_parts = list(args.command)
+    if args.auto and args.name:
+        command_parts.insert(0, args.name)
+    command = _strip_separator(command_parts)
     if not command:
         command = list(provider.login_command)
+
+    if args.auto:
+        from ai_auth_switch.auto_run import AutoRunConfig, acquire_auto_run_profile
+
+        config = AutoRunConfig(
+            usage_timeout=args.auto_usage_timeout,
+            usage_workers=args.auto_usage_workers,
+            usage_cache_ttl=args.auto_usage_cache_ttl,
+            refresh_usage=args.auto_refresh_usage,
+        )
+        with acquire_auto_run_profile(store, provider, config) as selection:
+            print(
+                f"ai-auth-switch: auto-selected {provider.id} profile "
+                f"{selection.profile} ({selection.remaining_percent:g}% remaining, "
+                f"{selection.active_leases} active auto run(s))",
+                file=sys.stderr,
+            )
+            return run_with_profile(
+                store,
+                provider,
+                selection.profile,
+                command,
+            )
 
     name = args.name
     if not name:
@@ -1034,6 +1111,118 @@ def _cmd_alias_install(args: argparse.Namespace) -> int:
         link.unlink()
     os.symlink(target, link)
     print(f"installed {alias.name} -> {target}")
+    return 0
+
+
+def _desktop_provider_and_store(args: argparse.Namespace) -> tuple[Provider, AuthStore]:
+    return _provider_by_id("codex", args), _store_from_args(args)
+
+
+def _cmd_desktop_auto_install(args: argparse.Namespace) -> int:
+    from ai_auth_switch.desktop import DesktopAutoConfig, install_desktop_auto
+
+    provider, store = _desktop_provider_and_store(args)
+    config = DesktopAutoConfig(
+        idle_seconds=args.idle_seconds,
+        cooldown_seconds=args.cooldown_seconds,
+        poll_seconds=args.poll_seconds,
+        switch_below_remaining=args.switch_below,
+        min_improvement=args.min_improvement,
+        usage_timeout=args.usage_timeout,
+        usage_workers=args.usage_workers,
+        usage_cache_ttl=args.usage_cache_ttl,
+    )
+    paths = install_desktop_auto(
+        store,
+        provider,
+        _alias_executable_target(),
+        config,
+        enable=not args.no_enable,
+    )
+    print(f"installed desktop auto-rotation service: {paths.service}")
+    print(f"installed managed ChatGPT launcher: {paths.launcher}")
+    if args.no_enable:
+        print("service installed but not enabled")
+    print("restart ChatGPT Desktop once to enter managed daemon mode")
+    return 0
+
+
+def _cmd_desktop_auto_status(args: argparse.Namespace) -> int:
+    from ai_auth_switch.desktop import desktop_auto_status
+
+    provider, store = _desktop_provider_and_store(args)
+    status = desktop_auto_status(store, provider)
+    if args.json:
+        print(json.dumps(status, indent=2, sort_keys=True))
+        return 0
+    print(f"installed: {'yes' if status['installed'] else 'no'}")
+    print(f"service enabled: {'yes' if status['service_enabled'] else 'no'}")
+    print(f"service active: {'yes' if status['service_active'] else 'no'}")
+    print(f"desktop mode: {status['desktop_mode']}")
+    print(f"current profile: {status['current_profile'] or 'not active'}")
+    active_threads = status["active_threads"]
+    if active_threads is not None:
+        print(f"active desktop turns: {len(active_threads)}")
+    if status["app_server_error"]:
+        print(f"app-server: {status['app_server_error']}")
+    if status["restart_required"]:
+        print("restart required: close and reopen ChatGPT Desktop once")
+    return 0
+
+
+def _cmd_desktop_auto_disable(args: argparse.Namespace) -> int:
+    from ai_auth_switch.desktop import disable_desktop_auto
+
+    _provider, store = _desktop_provider_and_store(args)
+    paths = disable_desktop_auto(store)
+    print(f"disabled desktop auto-rotation service: {paths.service}")
+    print("restart ChatGPT Desktop once to return to its direct app-server")
+    return 0
+
+
+def _cmd_desktop_auto_run(args: argparse.Namespace) -> int:
+    from ai_auth_switch.desktop import run_desktop_auto
+
+    provider, store = _desktop_provider_and_store(args)
+    return run_desktop_auto(store, provider)
+
+
+def _cmd_desktop_rotate(args: argparse.Namespace) -> int:
+    from ai_auth_switch.desktop import (
+        desktop_paths,
+        load_desktop_config,
+        load_desktop_state,
+        rotate_desktop_account,
+        save_desktop_state,
+    )
+
+    provider, store = _desktop_provider_and_store(args)
+    paths = desktop_paths(store)
+    config = load_desktop_config(paths.config)
+    state = load_desktop_state(paths.state)
+    result = rotate_desktop_account(
+        store,
+        provider,
+        config,
+        state,
+        force=args.now,
+    )
+    save_desktop_state(paths.state, state)
+    payload = {
+        "changed": result.changed,
+        "previous_profile": result.previous_profile,
+        "profile": result.profile,
+        "reason": result.reason,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    elif result.changed:
+        print(
+            f"desktop account: {result.previous_profile or '<none>'} "
+            f"-> {result.profile}"
+        )
+    else:
+        print(f"desktop account unchanged: {result.reason}")
     return 0
 
 
@@ -1301,10 +1490,41 @@ def build_parser(
     )
     run.add_argument("provider", nargs=opt(None), choices=SUPPORTED_PROVIDERS)
     run.add_argument(
+        "--auto",
+        action="store_true",
+        help="Automatically select a Codex profile by quota and active auto runs.",
+    )
+    run.add_argument(
+        "--auto-usage-timeout",
+        type=_positive_float,
+        default=5.0,
+        metavar="SECONDS",
+        help="Per-account auto-selection usage timeout (default: 5).",
+    )
+    run.add_argument(
+        "--auto-usage-workers",
+        type=_positive_int,
+        default=4,
+        metavar="COUNT",
+        help="Maximum concurrent auto-selection usage requests (default: 4).",
+    )
+    run.add_argument(
+        "--auto-usage-cache-ttl",
+        type=_nonnegative_float,
+        default=60.0,
+        metavar="SECONDS",
+        help="Reuse auto-selection usage results for this long (default: 60).",
+    )
+    run.add_argument(
+        "--auto-refresh-usage",
+        action="store_true",
+        help="Bypass cached usage during automatic profile selection.",
+    )
+    run.add_argument(
         "name",
         nargs="?",
-        help="Saved profile to activate; defaults to the provider default "
-        "or the nearest directory binding.",
+        help="Saved profile to activate; defaults to the provider default or "
+        "nearest directory binding. With --auto, this begins the child command.",
     )
     run.add_argument("command", nargs=argparse.REMAINDER)
     run.set_defaults(func=_cmd_run)
@@ -1364,6 +1584,122 @@ def build_parser(
     )
     alias_install.set_defaults(func=_cmd_alias_install)
 
+    desktop = subparsers.add_parser(
+        "desktop",
+        help="Manage ChatGPT Desktop account rotation.",
+    )
+    desktop_sub = desktop.add_subparsers(
+        dest="desktop_command",
+        required=require_command,
+    )
+
+    desktop_auto = desktop_sub.add_parser(
+        "auto",
+        help="Install or manage idle account auto-rotation.",
+    )
+    desktop_auto_sub = desktop_auto.add_subparsers(
+        dest="desktop_auto_command",
+        required=require_command,
+    )
+    desktop_auto_install = desktop_auto_sub.add_parser(
+        "install",
+        help="Install and enable idle account auto-rotation.",
+    )
+    desktop_auto_install.add_argument(
+        "--idle-seconds",
+        type=_nonnegative_float,
+        default=60.0,
+        metavar="SECONDS",
+        help="Require this much continuous desktop idle time (default: 60).",
+    )
+    desktop_auto_install.add_argument(
+        "--cooldown-seconds",
+        type=_nonnegative_float,
+        default=1800.0,
+        metavar="SECONDS",
+        help="Minimum time between account switches (default: 1800).",
+    )
+    desktop_auto_install.add_argument(
+        "--poll-seconds",
+        type=_positive_float,
+        default=15.0,
+        metavar="SECONDS",
+        help="Desktop state polling interval (default: 15).",
+    )
+    desktop_auto_install.add_argument(
+        "--switch-below",
+        type=_nonnegative_float,
+        default=10.0,
+        metavar="PERCENT",
+        help="Switch when current remaining quota is at or below this value "
+        "(default: 10).",
+    )
+    desktop_auto_install.add_argument(
+        "--min-improvement",
+        type=_nonnegative_float,
+        default=5.0,
+        metavar="PERCENT",
+        help="Required remaining-quota improvement before switching (default: 5).",
+    )
+    desktop_auto_install.add_argument(
+        "--usage-timeout",
+        type=_positive_float,
+        default=5.0,
+        metavar="SECONDS",
+        help="Per-account usage request timeout (default: 5).",
+    )
+    desktop_auto_install.add_argument(
+        "--usage-workers",
+        type=_positive_int,
+        default=4,
+        metavar="COUNT",
+        help="Maximum concurrent usage requests (default: 4).",
+    )
+    desktop_auto_install.add_argument(
+        "--usage-cache-ttl",
+        type=_nonnegative_float,
+        default=60.0,
+        metavar="SECONDS",
+        help="Reuse usage results for this long (default: 60).",
+    )
+    desktop_auto_install.add_argument(
+        "--no-enable",
+        action="store_true",
+        help="Write integration files without enabling the user service.",
+    )
+    desktop_auto_install.set_defaults(func=_cmd_desktop_auto_install)
+
+    desktop_auto_status_parser = desktop_auto_sub.add_parser(
+        "status",
+        help="Show desktop auto-rotation and app-server state.",
+    )
+    desktop_auto_status_parser.add_argument("--json", action="store_true")
+    desktop_auto_status_parser.set_defaults(func=_cmd_desktop_auto_status)
+
+    desktop_auto_disable = desktop_auto_sub.add_parser(
+        "disable",
+        help="Disable auto-rotation and restore the desktop launcher.",
+    )
+    desktop_auto_disable.set_defaults(func=_cmd_desktop_auto_disable)
+
+    desktop_auto_run = desktop_auto_sub.add_parser(
+        "run",
+        help="Run the installed auto-rotation worker.",
+    )
+    desktop_auto_run.set_defaults(func=_cmd_desktop_auto_run)
+
+    desktop_rotate = desktop_sub.add_parser(
+        "rotate",
+        help="Safely choose another desktop account while idle.",
+    )
+    desktop_rotate.add_argument(
+        "--now",
+        action="store_true",
+        help="Ignore quota threshold and cooldown, but never interrupt an active turn.",
+    )
+    desktop_rotate.add_argument("--json", action="store_true")
+    desktop_rotate.set_defaults(func=_cmd_desktop_rotate)
+
     completion = subparsers.add_parser(
         "completion",
         help="Print a shell completion script for bash, zsh, or fish.",
@@ -1395,6 +1731,7 @@ def main(argv: Sequence[str] | None = None, *, program_name: str | None = None) 
             if alias_status is not None:
                 return int(alias_status)
 
+        raw_argv = _normalize_run_auto_options(raw_argv)
         args = parser.parse_args(raw_argv)
         return int(args.func(args))
     except AiAuthSwitchError as exc:

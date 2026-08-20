@@ -7,7 +7,7 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, tzinfo
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -36,6 +36,13 @@ class AccountUsage:
     credits_balance: str | None = None
     credits_unlimited: bool = False
     error: str | None = None
+
+
+def is_free_plan(usage: AccountUsage | None) -> bool:
+    plan_type = usage.plan_type if usage is not None else None
+    return isinstance(plan_type, str) and plan_type.strip().casefold().startswith(
+        "free"
+    )
 
 
 def _read_auth(path: Path) -> tuple[str | None, str | None]:
@@ -229,7 +236,7 @@ def _window_to_dict(window: UsageWindow | None) -> dict[str, Any] | None:
         "used_percent": window.used_percent,
         "window_seconds": window.window_seconds,
         "resets_at": window.resets_at,
-        "resets_at_iso": _reset_at_iso(window.resets_at),
+        "resets_at_iso": _reset_at_iso(window.resets_at, tz=timezone.utc),
     }
 
 
@@ -267,15 +274,14 @@ def _usage_from_dict(data: object) -> AccountUsage:
     )
 
 
-def _reset_at_iso(resets_at: int | None) -> str | None:
+def _reset_at_iso(resets_at: int | None, *, tz: tzinfo | None = None) -> str | None:
     if resets_at is None:
         return None
     try:
-        return (
-            datetime.fromtimestamp(resets_at, tz=timezone.utc)
-            .isoformat(timespec="seconds")
-            .replace("+00:00", "Z")
-        )
+        value = datetime.fromtimestamp(resets_at, tz=timezone.utc)
+        value = value.astimezone() if tz is None else value.astimezone(tz)
+        rendered = value.isoformat(timespec="seconds")
+        return rendered.replace("+00:00", "Z") if tz is timezone.utc else rendered
     except (OverflowError, OSError, ValueError):
         return None
 
@@ -301,15 +307,25 @@ def _remaining_time(seconds: float) -> str:
     return f"in {detail}"
 
 
-def format_reset_time(resets_at: int | None, *, now: float | None = None) -> str | None:
-    reset_iso = _reset_at_iso(resets_at)
+def format_reset_time(
+    resets_at: int | None,
+    *,
+    now: float | None = None,
+    tz: tzinfo | None = None,
+) -> str | None:
+    reset_iso = _reset_at_iso(resets_at, tz=tz)
     if reset_iso is None or resets_at is None:
         return None
     current = time.time() if now is None else now
     return f"resets {reset_iso} ({_remaining_time(resets_at - current)})"
 
 
-def format_window(window: UsageWindow, *, now: float | None = None) -> str:
+def format_window(
+    window: UsageWindow,
+    *,
+    now: float | None = None,
+    tz: tzinfo | None = None,
+) -> str:
     if window.window_seconds and window.window_seconds % 3600 == 0:
         label = f"{window.window_seconds // 3600}h"
     elif window.window_seconds and window.window_seconds % 60 == 0:
@@ -317,11 +333,16 @@ def format_window(window: UsageWindow, *, now: float | None = None) -> str:
     else:
         label = "window"
     rendered = f"{label} {window.remaining_percent:g}% left"
-    reset = format_reset_time(window.resets_at, now=now)
+    reset = format_reset_time(window.resets_at, now=now, tz=tz)
     return f"{rendered}, {reset}" if reset else rendered
 
 
-def format_usage(usage: AccountUsage, *, now: float | None = None) -> str:
+def format_usage(
+    usage: AccountUsage,
+    *,
+    now: float | None = None,
+    tz: tzinfo | None = None,
+) -> str:
     if usage.error:
         return f"usage unavailable: {usage.error}"
     parts = []
@@ -329,7 +350,7 @@ def format_usage(usage: AccountUsage, *, now: float | None = None) -> str:
         parts.append(usage.plan_type)
     for window in (usage.primary, usage.secondary):
         if window:
-            parts.append(format_window(window, now=now))
+            parts.append(format_window(window, now=now, tz=tz))
     if usage.credits_unlimited:
         parts.append("credits unlimited")
     elif usage.credits_balance is not None:

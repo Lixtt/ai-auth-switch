@@ -18,7 +18,7 @@ from ai_auth_switch.store import AuthStore
 class CompletionTests(unittest.TestCase):
     def test_top_level_commands(self) -> None:
         candidates = complete_words([""])
-        for expected in ("auth", "alias", "run", "completion"):
+        for expected in ("auth", "alias", "desktop", "run", "completion"):
             self.assertIn(expected, candidates)
         # Prefix filtering applies to the current word.
         self.assertIn("auth", complete_words(["a"]))
@@ -48,7 +48,9 @@ class CompletionTests(unittest.TestCase):
             codex_home = root / ".codex"
             codex_home.mkdir()
             store_dir = root / "store"
-            provider = CodexProvider(codex_home=codex_home, login_command=["fake-codex"])
+            provider = CodexProvider(
+                codex_home=codex_home, login_command=["fake-codex"]
+            )
             store = AuthStore(store_dir)
             active = codex_home / "auth.json"
             active.write_text(
@@ -86,7 +88,9 @@ class CompletionTests(unittest.TestCase):
             codex_home = root / ".codex"
             codex_home.mkdir()
             store_dir = root / "store"
-            provider = CodexProvider(codex_home=codex_home, login_command=["fake-codex"])
+            provider = CodexProvider(
+                codex_home=codex_home, login_command=["fake-codex"]
+            )
             store = AuthStore(store_dir)
             active = codex_home / "auth.json"
             active.write_text(
@@ -102,7 +106,18 @@ class CompletionTests(unittest.TestCase):
             self.assertIn("work", candidates)
 
     def test_remainder_after_double_dash_yields_nothing(self) -> None:
-        self.assertEqual(complete_words(["run", "codex", "a@example.com", "--", ""]), [])
+        self.assertEqual(
+            complete_words(["run", "codex", "a@example.com", "--", ""]), []
+        )
+
+    def test_desktop_subcommands_complete(self) -> None:
+        self.assertIn("auto", complete_words(["desktop", ""]))
+        self.assertIn("rotate", complete_words(["desktop", ""]))
+        self.assertIn("install", complete_words(["desktop", "auto", ""]))
+        self.assertIn("status", complete_words(["desktop", "auto", ""]))
+
+    def test_run_auto_option_completes_after_provider(self) -> None:
+        self.assertIn("--auto", complete_words(["run", "codex", "--a"]))
 
     def test_invalid_input_does_not_crash(self) -> None:
         self.assertEqual(complete_words(["auth", "not-a-command", ""]), [])

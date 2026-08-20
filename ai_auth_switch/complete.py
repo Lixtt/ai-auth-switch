@@ -62,6 +62,12 @@ def _command_path(ns: argparse.Namespace) -> tuple[str, ...]:
             parts.append(ns.auth_command)
         if command_name == "alias" and getattr(ns, "alias_command", None):
             parts.append(ns.alias_command)
+        if command_name == "desktop" and getattr(ns, "desktop_command", None):
+            parts.append(ns.desktop_command)
+            if ns.desktop_command == "auto" and getattr(
+                ns, "desktop_auto_command", None
+            ):
+                parts.append(ns.desktop_auto_command)
     return tuple(parts)
 
 
