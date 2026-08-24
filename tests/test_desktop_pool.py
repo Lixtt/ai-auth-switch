@@ -121,6 +121,36 @@ class DesktopPoolTests(unittest.TestCase):
             )
             self.assertEqual(config.read_text(encoding="utf-8"), original_config)
 
+    def test_reinstall_does_not_self_reference_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = AuthStore(root / "store")
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            provider.active_auth_path.parent.mkdir(parents=True)
+            config = provider.active_auth_path.parent / "config.toml"
+            config.write_text('model_provider = "custom"\n', encoding="utf-8")
+            paths = DesktopPoolPaths(
+                launcher=root / "applications" / "chatgpt.desktop",
+                launcher_backup=root / "desktop-pool" / "launcher.backup",
+                wrapper=root / "desktop-pool" / "launcher",
+                service=root / "systemd" / "ai-auth-switch-desktop-pool.service",
+                auto_service_state=root / "desktop-pool" / "auto-service-state",
+            )
+            paths.launcher.parent.mkdir(parents=True)
+            original = "[Desktop Entry]\nExec=/usr/bin/chatgpt %U\nType=Application\n"
+            paths.launcher.write_text(original, encoding="utf-8")
+
+            def runner(command, **_kwargs):
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            install_desktop_pool(store, provider, paths=paths, runner=runner)
+            # Simulate a user re-running the install after the launcher already
+            # points at the wrapper (the historical self-reference failure).
+            install_desktop_pool(store, provider, paths=paths, runner=runner)
+            wrapper_text = paths.wrapper.read_text(encoding="utf-8")
+            self.assertIn('exec /usr/bin/chatgpt "$@"', wrapper_text)
+            self.assertNotIn(str(paths.wrapper), wrapper_text)
+
 
 if __name__ == "__main__":
     unittest.main()

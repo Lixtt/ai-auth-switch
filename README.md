@@ -40,6 +40,9 @@ Version 0.6.2 prevents the legacy desktop idle-rotation worker from racing
 with the account-pool daemon; installing the pool pauses that worker and
 disabling the pool restores its previous enabled state.
 
+Version 0.6.3 makes repeated Desktop pool installation safe: it reuses the
+pristine launcher backup instead of wrapping the pool launcher recursively.
+
 To install the newest source directly from the official GitHub repository:
 
 ```bash

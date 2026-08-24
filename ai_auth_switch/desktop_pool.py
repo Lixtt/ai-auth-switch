@@ -174,7 +174,18 @@ def install_desktop_pool(
         raise AiAuthSwitchError(
             f"failed to read ChatGPT desktop launcher {source}: {exc}"
         ) from exc
-    command = _desktop_command(content)
+    # Re-running the install must not capture the pool wrapper as the desktop
+    # command: once the launcher points at the wrapper, reading it back would
+    # produce a self-referencing wrapper that never starts ChatGPT. Prefer the
+    # pristine backup for command extraction, falling back to the current or
+    # system launcher when no backup exists yet.
+    command_content = content
+    if target.launcher_backup.exists():
+        try:
+            command_content = target.launcher_backup.read_text(encoding="utf-8")
+        except OSError:
+            command_content = content
+    command = _desktop_command(command_content)
     token_path = default_token_path(store)
     ensure_listener_token(token_path)
     config_result = install_pool_provider(
