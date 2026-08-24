@@ -47,6 +47,9 @@ Version 0.6.4 adds systemd mutual exclusion between the pool service and the
 legacy desktop auto-rotation service, preventing either worker from starting
 the other mode underneath it.
 
+Version 0.6.5 accepts the OpenAI VS Code extension's `app-server` argument in
+any position, including after extension-specific flags.
+
 To install the newest source directly from the official GitHub repository:
 
 ```bash

@@ -2029,8 +2029,7 @@ def main(argv: Sequence[str] | None = None, *, program_name: str | None = None) 
 
 def pool_app_server_main() -> int:
     forwarded = list(sys.argv[1:])
-    if forwarded and forwarded[0] == "app-server":
-        forwarded.pop(0)
+    forwarded = [token for token in forwarded if token != "app-server"]
     ignored_flags = {"--analytics-default-enabled", "--stdio", "--strict-config"}
     ignored_with_value = {
         "--listen",

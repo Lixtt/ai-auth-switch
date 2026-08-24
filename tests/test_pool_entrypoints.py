@@ -31,6 +31,28 @@ class PoolEntrypointTests(unittest.TestCase):
             program_name="ai-auth-switch",
         )
 
+    def test_app_server_argument_is_removed_when_extension_places_it_after_flags(
+        self,
+    ) -> None:
+        with (
+            mock.patch.object(cli, "main", return_value=7) as main,
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "ais-pool-app-server",
+                    "--analytics-default-enabled",
+                    "app-server",
+                    "--stdio",
+                ],
+            ),
+        ):
+            self.assertEqual(cli.pool_app_server_main(), 7)
+        main.assert_called_once_with(
+            ["pool", "app-server"],
+            program_name="ai-auth-switch",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
