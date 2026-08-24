@@ -886,6 +886,8 @@ def _service_text(
         "[Unit]\n"
         "Description=ai-auth-switch desktop account auto-rotation\n"
         "After=graphical-session.target\n\n"
+        "Conflicts=ai-auth-switch-desktop-pool.service\n"
+        "Before=ai-auth-switch-desktop-pool.service\n\n"
         "[Service]\n"
         "Type=simple\n"
         f"ExecStart={command}\n"

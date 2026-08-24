@@ -143,6 +143,8 @@ def _service_text(
         "[Unit]\n"
         "Description=ai-auth-switch local Codex account pool\n"
         "After=graphical-session.target\n\n"
+        "Conflicts=ai-auth-switch-desktop-auto.service\n"
+        "Before=ai-auth-switch-desktop-auto.service\n\n"
         "[Service]\n"
         "Type=simple\n"
         f"ExecStart={command}\n"

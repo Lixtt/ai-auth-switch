@@ -43,6 +43,10 @@ disabling the pool restores its previous enabled state.
 Version 0.6.3 makes repeated Desktop pool installation safe: it reuses the
 pristine launcher backup instead of wrapping the pool launcher recursively.
 
+Version 0.6.4 adds systemd mutual exclusion between the pool service and the
+legacy desktop auto-rotation service, preventing either worker from starting
+the other mode underneath it.
+
 To install the newest source directly from the official GitHub repository:
 
 ```bash
