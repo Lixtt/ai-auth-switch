@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from ai_auth_switch.desktop import (
+    SERVICE_NAME,
     _refresh_desktop_database,
     _systemctl,
     desktop_paths,
@@ -41,6 +42,7 @@ class DesktopPoolPaths:
     wrapper: Path
     service: Path
     config_backup: Path | None = None
+    auto_service_state: Path | None = None
 
 
 def desktop_pool_paths(store: AuthStore) -> DesktopPoolPaths:
@@ -51,6 +53,7 @@ def desktop_pool_paths(store: AuthStore) -> DesktopPoolPaths:
         launcher_backup=base / "chatgpt.desktop.original",
         wrapper=base / "chatgpt-pool-launcher",
         service=normal.service.parent / POOL_DESKTOP_SERVICE,
+        auto_service_state=base / "auto-service-state",
     )
 
 
@@ -184,8 +187,19 @@ def install_desktop_pool(
         target.wrapper,
         target.service,
         config_result.backup_path,
+        target.auto_service_state,
     )
     try:
+        auto_active = (
+            _systemctl("is-active", SERVICE_NAME, runner=runner, check=False).returncode
+            == 0
+        )
+        if target.auto_service_state is not None:
+            atomic_write(
+                target.auto_service_state,
+                "active\n" if auto_active else "inactive\n",
+            )
+        _systemctl("disable", "--now", SERVICE_NAME, runner=runner, check=False)
         target.wrapper.parent.mkdir(parents=True, exist_ok=True)
         set_private_permissions(target.wrapper.parent)
         _write_wrapper(target.wrapper, command, token_path)
@@ -210,6 +224,9 @@ def install_desktop_pool(
                 runner=runner,
                 check=False,
             )
+        if "auto_active" in locals() and auto_active:
+            with suppress(AiAuthSwitchError):
+                _systemctl("enable", "--now", SERVICE_NAME, runner=runner)
         if had_launcher:
             atomic_write(target.launcher, content)
         elif target.launcher.exists():
@@ -250,6 +267,18 @@ def disable_desktop_pool(
             target.launcher.unlink()
     _refresh_desktop_database(target.launcher.parent, runner=runner)
     _systemctl("daemon-reload", runner=runner, check=False)
+    if target.auto_service_state is not None:
+        try:
+            auto_was_active = (
+                target.auto_service_state.read_text(encoding="utf-8").strip()
+                == "active"
+            )
+        except OSError:
+            auto_was_active = False
+        if auto_was_active:
+            _systemctl("enable", "--now", SERVICE_NAME, runner=runner)
+        with suppress(OSError):
+            target.auto_service_state.unlink()
     config_path = provider.active_auth_path.parent / "config.toml"
     try:
         current_config = parse_toml(config_path.read_text(encoding="utf-8"))

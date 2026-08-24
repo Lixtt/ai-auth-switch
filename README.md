@@ -36,6 +36,10 @@ Version 0.6.1 refines upstream 403 handling so malformed or policy-rejected
 Responses requests cool down an account without incorrectly marking its OAuth
 credentials as permanently expired.
 
+Version 0.6.2 prevents the legacy desktop idle-rotation worker from racing
+with the account-pool daemon; installing the pool pauses that worker and
+disabling the pool restores its previous enabled state.
+
 To install the newest source directly from the official GitHub repository:
 
 ```bash

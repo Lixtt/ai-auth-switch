@@ -32,6 +32,7 @@ class DesktopPoolTests(unittest.TestCase):
                 launcher_backup=root / "desktop-pool" / "launcher.backup",
                 wrapper=root / "desktop-pool" / "launcher",
                 service=root / "systemd" / "ai-auth-switch-desktop-pool.service",
+                auto_service_state=root / "desktop-pool" / "auto-service-state",
             )
             paths.launcher.parent.mkdir(parents=True)
             original = "[Desktop Entry]\nExec=/usr/bin/chatgpt %U\nType=Application\n"
@@ -60,6 +61,9 @@ class DesktopPoolTests(unittest.TestCase):
             self.assertEqual(parsed["model_provider"], "ai-auth-switch-pool")
             self.assertIsNotNone(installed.config_backup)
             self.assertTrue(any("enable" in call for call in calls))
+            self.assertTrue(
+                any("ai-auth-switch-desktop-auto.service" in call for call in calls)
+            )
 
             disable_desktop_pool(store, provider, paths=paths, runner=runner)
             self.assertEqual(paths.launcher.read_text(encoding="utf-8"), original)
@@ -69,6 +73,12 @@ class DesktopPoolTests(unittest.TestCase):
                 "custom",
             )
             self.assertTrue(any("disable" in call for call in calls))
+            self.assertTrue(
+                any(
+                    "enable" in call and "ai-auth-switch-desktop-auto.service" in call
+                    for call in calls
+                )
+            )
 
     def test_failed_service_enable_rolls_back_launcher_and_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -84,6 +94,7 @@ class DesktopPoolTests(unittest.TestCase):
                 launcher_backup=root / "desktop-pool" / "launcher.backup",
                 wrapper=root / "desktop-pool" / "launcher",
                 service=root / "systemd" / "ai-auth-switch-desktop-pool.service",
+                auto_service_state=root / "desktop-pool" / "auto-service-state",
             )
             paths.launcher.parent.mkdir(parents=True)
             original_launcher = "[Desktop Entry]\nExec=/usr/bin/chatgpt %U\n"
