@@ -96,6 +96,13 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return parsed
+
+
 def _nonnegative_float(value: str) -> float:
     parsed = float(value)
     if parsed < 0:
@@ -159,9 +166,7 @@ def _normalize_run_auto_options(argv: Sequence[str]) -> list[str]:
 def _provider_from_args(args: argparse.Namespace) -> Provider:
     codex_home = Path(args.codex_home).expanduser() if args.codex_home else None
     claude_config_dir = (
-        Path(args.claude_config_dir).expanduser()
-        if args.claude_config_dir
-        else None
+        Path(args.claude_config_dir).expanduser() if args.claude_config_dir else None
     )
     return get_provider(
         args.provider,
@@ -184,9 +189,7 @@ def _provider_ids(args: argparse.Namespace) -> list[str]:
 def _provider_by_id(provider_id: str, args: argparse.Namespace) -> Provider:
     codex_home = Path(args.codex_home).expanduser() if args.codex_home else None
     claude_config_dir = (
-        Path(args.claude_config_dir).expanduser()
-        if args.claude_config_dir
-        else None
+        Path(args.claude_config_dir).expanduser() if args.claude_config_dir else None
     )
     return get_provider(
         provider_id,
@@ -209,7 +212,9 @@ def _alias_executable_target(target: str | Path | None = None) -> Path:
     try:
         resolved = candidate.resolve(strict=True)
     except OSError as exc:
-        raise AiAuthSwitchError(f"ai-auth-switch executable not found: {candidate}") from exc
+        raise AiAuthSwitchError(
+            f"ai-auth-switch executable not found: {candidate}"
+        ) from exc
     if not resolved.is_file() or not os.access(resolved, os.X_OK):
         raise AiAuthSwitchError(f"ai-auth-switch executable not found: {candidate}")
     return resolved
@@ -263,7 +268,9 @@ def _sync_numbered_alias_executables(
     try:
         bin_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        raise AiAuthSwitchError(f"failed to create alias directory {bin_dir}: {exc}") from exc
+        raise AiAuthSwitchError(
+            f"failed to create alias directory {bin_dir}: {exc}"
+        ) from exc
 
     installed: list[Path] = []
     updated: list[Path] = []
@@ -297,15 +304,14 @@ def _sync_numbered_alias_executables(
     try:
         candidates = list(bin_dir.iterdir())
     except OSError as exc:
-        raise AiAuthSwitchError(f"failed to inspect alias directory {bin_dir}: {exc}") from exc
+        raise AiAuthSwitchError(
+            f"failed to inspect alias directory {bin_dir}: {exc}"
+        ) from exc
     for link in candidates:
         if (
             numbered_provider_alias_index(provider_id, link.name) is not None
             and link.name not in automatic
-            and (
-                _symlink_points_to(link, target)
-                or _is_managed_alias_link(link)
-            )
+            and (_symlink_points_to(link, target) or _is_managed_alias_link(link))
         ):
             try:
                 link.unlink()
@@ -479,7 +485,9 @@ def _sync_after_auth_change(
             store_dir=store.base_dir,
         )
     except AiAuthSwitchError as exc:
-        results = [SyncResult(target="dependent-sync", status="error", message=str(exc))]
+        results = [
+            SyncResult(target="dependent-sync", status="error", message=str(exc))
+        ]
     _print_sync_results(results)
     return results
 
@@ -537,10 +545,7 @@ def _cmd_auth_list(args: argparse.Namespace) -> int:
             if usage is not None:
                 suffix += f" ({format_usage(usage)})"
             actual_name = provider.infer_profile_name(profile.path)
-            if (
-                actual_name
-                and actual_name.casefold() != profile.name.casefold()
-            ):
+            if actual_name and actual_name.casefold() != profile.name.casefold():
                 suffix += f" (actual auth: {actual_name})"
             if args.json:
                 entry = {
@@ -881,9 +886,13 @@ def _cmd_auth_login(args: argparse.Namespace) -> int:
     store = _store_from_args(args)
     name, login_args = _split_login_name_and_args(args.login_args)
     active = provider.active_auth_path
-    backup = active.with_name(f".{active.name}.login-backup.{os.getpid()}.{time.time_ns()}")
+    backup = active.with_name(
+        f".{active.name}.login-backup.{os.getpid()}.{time.time_ns()}"
+    )
     had_active = False
-    state_path = provider.config_state_path if isinstance(provider, ClaudeProvider) else None
+    state_path = (
+        provider.config_state_path if isinstance(provider, ClaudeProvider) else None
+    )
     state_backup = (
         state_path.with_name(
             f".{state_path.name}.login-backup.{os.getpid()}.{time.time_ns()}"
@@ -991,9 +1000,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     name = args.name
     if not name:
-        name = store.get_default(provider) or resolve_binding(
-            provider.id, Path.cwd()
-        )
+        name = store.get_default(provider) or resolve_binding(provider.id, Path.cwd())
     if not name:
         raise AiAuthSwitchError(
             f"no profile specified; pass a profile name, or set a default with "
@@ -1100,7 +1107,9 @@ def _cmd_alias_install(args: argparse.Namespace) -> int:
     if alias is None:
         raise AiAuthSwitchError(f"alias not found: {args.name}")
 
-    bin_dir = Path(args.bin_dir).expanduser() if args.bin_dir else Path.home() / ".local/bin"
+    bin_dir = (
+        Path(args.bin_dir).expanduser() if args.bin_dir else Path.home() / ".local/bin"
+    )
     target = _alias_executable_target(args.target)
 
     bin_dir.mkdir(parents=True, exist_ok=True)
@@ -1226,6 +1235,153 @@ def _cmd_desktop_rotate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_desktop_pool_install(args: argparse.Namespace) -> int:
+    from ai_auth_switch.desktop_pool import install_desktop_pool
+
+    provider, store = _desktop_provider_and_store(args)
+    paths = install_desktop_pool(store, provider, port=args.pool_port)
+    print(f"installed desktop pool launcher: {paths.launcher}")
+    print(f"installed desktop pool service: {paths.service}")
+    if paths.config_backup:
+        print(f"saved previous Codex config: {paths.config_backup}")
+    print("restart ChatGPT Desktop once to use the local account pool")
+    return 0
+
+
+def _cmd_desktop_pool_disable(args: argparse.Namespace) -> int:
+    from ai_auth_switch.desktop_pool import disable_desktop_pool
+
+    provider, store = _desktop_provider_and_store(args)
+    paths = disable_desktop_pool(store, provider)
+    print(f"disabled desktop pool service: {paths.service}")
+    print("restart ChatGPT Desktop once to restore its original launcher")
+    return 0
+
+
+def _cmd_desktop_pool_status(args: argparse.Namespace) -> int:
+    from ai_auth_switch.desktop_pool import desktop_pool_status
+
+    provider, store = _desktop_provider_and_store(args)
+    status = desktop_pool_status(store, provider)
+    if args.json:
+        print(json.dumps(status, indent=2, sort_keys=True))
+    else:
+        print(f"installed: {'yes' if status['installed'] else 'no'}")
+        print(f"launcher: {status['launcher']}")
+        print(f"service: {status['service']}")
+        print(f"token file: {status['token_file']}")
+    return 0
+
+
+def _cmd_pool_app_server(args: argparse.Namespace) -> int:
+    from ai_auth_switch.pool_server import PoolAppServer, PoolServerConfig
+
+    provider, store = _desktop_provider_and_store(args)
+    command = [args.codex_bin] if args.codex_bin else None
+    server = PoolAppServer(
+        store,
+        provider,
+        command=command,
+        config=PoolServerConfig(
+            usage_timeout=args.pool_usage_timeout,
+            usage_workers=args.pool_usage_workers,
+            usage_cache_ttl=args.pool_usage_cache_ttl,
+            refresh_usage=args.pool_refresh_usage,
+            backend_timeout=args.pool_backend_timeout,
+        ),
+    )
+    return server.run()
+
+
+def _cmd_pool_responses(args: argparse.Namespace) -> int:
+    from ai_auth_switch.pool_responses import PoolResponsesProxy, ResponsesProxyConfig
+
+    provider, store = _desktop_provider_and_store(args)
+    proxy = PoolResponsesProxy(
+        store,
+        provider,
+        config=ResponsesProxyConfig(
+            upstream_url=args.pool_upstream_url,
+            host=args.pool_host,
+            port=args.pool_port,
+            usage_timeout=args.pool_usage_timeout,
+            usage_workers=args.pool_usage_workers,
+            usage_cache_ttl=args.pool_usage_cache_ttl,
+            refresh_usage=args.pool_refresh_usage,
+            max_retries=args.pool_max_retries,
+            request_timeout=args.pool_request_timeout,
+            token_file=Path(args.pool_token_file).expanduser()
+            if args.pool_token_file
+            else None,
+        ),
+    )
+    address = f"http://{args.pool_host}:{args.pool_port}"
+    print(f"pool Responses endpoint: {address}/v1/responses")
+    print(f"pool token file: {proxy.token_path}")
+    print(
+        "set the custom provider API key from that file; keep the listener loopback-only"
+    )
+    proxy.serve_forever()
+    return 0
+
+
+def _cmd_pool_configure(args: argparse.Namespace) -> int:
+    from ai_auth_switch.pool_config import install_pool_provider
+
+    provider = _provider_by_id("codex", args)
+    result = install_pool_provider(
+        provider.active_auth_path.parent,
+        base_url=f"http://127.0.0.1:{args.pool_port}/v1",
+        provider_id=args.pool_provider_id,
+        env_key=args.pool_env_key,
+        backup=not args.pool_no_backup,
+    )
+    print(
+        f"configured Codex custom provider {result.provider_id}: {result.config_path}"
+    )
+    if result.backup_path:
+        print(f"saved previous config: {result.backup_path}")
+    if not result.changed:
+        print("configuration already matched")
+    token_file = Path(args.pool_token_file).expanduser()
+    print(f'export {args.pool_env_key}="$(cat {token_file})"')
+    return 0
+
+
+def _cmd_pool_restore(args: argparse.Namespace) -> int:
+    from ai_auth_switch.pool_config import restore_codex_config
+
+    provider = _provider_by_id("codex", args)
+    path = restore_codex_config(
+        provider.active_auth_path.parent,
+        Path(args.pool_backup),
+    )
+    print(f"restored Codex config: {path}")
+    return 0
+
+
+def _cmd_pool_status(args: argparse.Namespace) -> int:
+    from ai_auth_switch.pool import PoolCoordinator
+
+    provider = _provider_by_id("codex", args)
+    store = _store_from_args(args)
+    coordinator = PoolCoordinator(store, provider)
+    state = coordinator.load()
+    payload = state.to_dict()
+    payload["provider"] = provider.id
+    payload["state_path"] = str(coordinator.path)
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+    print(f"provider: {provider.id}")
+    print(f"state: {payload['state_path']}")
+    print(f"leases: {len(state.leases)}")
+    print(f"routes: {len(state.routes)}")
+    for profile, health in sorted(state.health.items()):
+        print(f"{profile}: {health.status}")
+    return 0
+
+
 def _cmd_completion(args: argparse.Namespace) -> int:
     scripts = {
         "bash": bash_completion_script,
@@ -1290,7 +1446,9 @@ def build_parser(
         prog=prog,
         description="Switch auth profiles for AI coding agents.",
     )
-    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
+    )
     parser.add_argument(
         "--store-dir",
         help="Profile store directory. Defaults to $AI_AUTH_SWITCH_HOME or ~/.local/share/ai-auth-switch.",
@@ -1309,14 +1467,10 @@ def build_parser(
         help="Do not sync Hermes/OpenClaw after changing active Codex auth.",
     )
 
-    subparsers = parser.add_subparsers(
-        dest="command_name", required=require_command
-    )
+    subparsers = parser.add_subparsers(dest="command_name", required=require_command)
 
     auth = subparsers.add_parser("auth", help="Manage saved auth profiles.")
-    auth_sub = auth.add_subparsers(
-        dest="auth_command", required=require_command
-    )
+    auth_sub = auth.add_subparsers(dest="auth_command", required=require_command)
 
     auth_list = auth_sub.add_parser("list", help="List profiles.")
     auth_list.add_argument("provider", nargs="?", choices=SUPPORTED_PROVIDERS)
@@ -1362,7 +1516,9 @@ def build_parser(
     auth_current.add_argument("provider", nargs="?", choices=SUPPORTED_PROVIDERS)
     auth_current.set_defaults(func=_cmd_auth_current)
 
-    auth_save = auth_sub.add_parser("save", help="Save the active auth file as a profile.")
+    auth_save = auth_sub.add_parser(
+        "save", help="Save the active auth file as a profile."
+    )
     auth_save.add_argument("provider", nargs=opt(None), choices=SUPPORTED_PROVIDERS)
     auth_save.add_argument("name", nargs="?")
     auth_save.set_defaults(func=_cmd_auth_save)
@@ -1404,7 +1560,9 @@ def build_parser(
     )
     auth_sync.set_defaults(func=_cmd_auth_sync)
 
-    auth_login = auth_sub.add_parser("login", help="Run provider login and save the result.")
+    auth_login = auth_sub.add_parser(
+        "login", help="Run provider login and save the result."
+    )
     auth_login.add_argument("provider", nargs=opt(None), choices=SUPPORTED_PROVIDERS)
     auth_login.add_argument("login_args", nargs=argparse.REMAINDER)
     auth_login.set_defaults(func=_cmd_auth_login)
@@ -1530,9 +1688,7 @@ def build_parser(
     run.set_defaults(func=_cmd_run)
 
     alias = subparsers.add_parser("alias", help="Manage command aliases.")
-    alias_sub = alias.add_subparsers(
-        dest="alias_command", required=require_command
-    )
+    alias_sub = alias.add_subparsers(dest="alias_command", required=require_command)
 
     alias_list = alias_sub.add_parser("list", help="List command aliases.")
     alias_list.set_defaults(func=_cmd_alias_list)
@@ -1553,7 +1709,9 @@ def build_parser(
         help="Alias executable name, for example codex-work or claude-work.",
     )
     alias_set.add_argument("provider", nargs=opt(None), choices=SUPPORTED_PROVIDERS)
-    alias_set.add_argument("profile", nargs=opt(None), help="Saved provider profile to activate.")
+    alias_set.add_argument(
+        "profile", nargs=opt(None), help="Saved provider profile to activate."
+    )
     alias_set.add_argument(
         "command",
         nargs=argparse.REMAINDER,
@@ -1700,6 +1858,131 @@ def build_parser(
     desktop_rotate.add_argument("--json", action="store_true")
     desktop_rotate.set_defaults(func=_cmd_desktop_rotate)
 
+    desktop_pool = desktop_sub.add_parser(
+        "pool",
+        help="Connect ChatGPT Desktop to the local account pool.",
+    )
+    desktop_pool_sub = desktop_pool.add_subparsers(
+        dest="desktop_pool_command", required=require_command
+    )
+    desktop_pool_install = desktop_pool_sub.add_parser(
+        "install", help="Install and enable the desktop pool launcher and service."
+    )
+    desktop_pool_install.add_argument("--pool-port", type=_positive_int, default=8765)
+    desktop_pool_install.set_defaults(func=_cmd_desktop_pool_install)
+    desktop_pool_disable = desktop_pool_sub.add_parser(
+        "disable", help="Disable the desktop pool and restore the launcher."
+    )
+    desktop_pool_disable.set_defaults(func=_cmd_desktop_pool_disable)
+    desktop_pool_status = desktop_pool_sub.add_parser(
+        "status", help="Show desktop pool installation state."
+    )
+    desktop_pool_status.add_argument("--json", action="store_true")
+    desktop_pool_status.set_defaults(func=_cmd_desktop_pool_status)
+
+    pool = subparsers.add_parser(
+        "pool",
+        help="Run the local multi-account pool router.",
+    )
+    pool_sub = pool.add_subparsers(
+        dest="pool_command",
+        required=require_command,
+    )
+    pool_server = pool_sub.add_parser(
+        "app-server",
+        help="Run the pool as an app-server JSONL multiplexer.",
+    )
+    pool_server.add_argument(
+        "--codex-bin",
+        help="Codex executable used for isolated backend app-servers.",
+    )
+    pool_server.add_argument(
+        "--pool-usage-timeout",
+        type=_positive_float,
+        default=5.0,
+        metavar="SECONDS",
+    )
+    pool_server.add_argument(
+        "--pool-usage-workers",
+        type=_positive_int,
+        default=4,
+        metavar="COUNT",
+    )
+    pool_server.add_argument(
+        "--pool-usage-cache-ttl",
+        type=_nonnegative_float,
+        default=60.0,
+        metavar="SECONDS",
+    )
+    pool_server.add_argument(
+        "--pool-refresh-usage",
+        action="store_true",
+    )
+    pool_server.add_argument(
+        "--pool-backend-timeout",
+        type=_positive_float,
+        default=10.0,
+        metavar="SECONDS",
+    )
+    pool_server.set_defaults(func=_cmd_pool_app_server)
+
+    pool_responses = pool_sub.add_parser(
+        "responses",
+        help="Run a loopback Responses API pool proxy.",
+    )
+    pool_responses.add_argument("--pool-host", default="127.0.0.1")
+    pool_responses.add_argument("--pool-port", type=_positive_int, default=8765)
+    pool_responses.add_argument(
+        "--pool-upstream-url",
+        default="https://chatgpt.com/backend-api/responses",
+    )
+    pool_responses.add_argument("--pool-token-file")
+    pool_responses.add_argument(
+        "--pool-usage-timeout", type=_positive_float, default=5.0, metavar="SECONDS"
+    )
+    pool_responses.add_argument(
+        "--pool-usage-workers", type=_positive_int, default=4, metavar="COUNT"
+    )
+    pool_responses.add_argument(
+        "--pool-usage-cache-ttl",
+        type=_nonnegative_float,
+        default=60.0,
+        metavar="SECONDS",
+    )
+    pool_responses.add_argument("--pool-refresh-usage", action="store_true")
+    pool_responses.add_argument("--pool-max-retries", type=_nonnegative_int, default=2)
+    pool_responses.add_argument(
+        "--pool-request-timeout", type=_positive_float, default=120.0, metavar="SECONDS"
+    )
+    pool_responses.set_defaults(func=_cmd_pool_responses)
+
+    pool_configure = pool_sub.add_parser(
+        "configure",
+        help="Install the loopback pool as the active Codex custom provider.",
+    )
+    pool_configure.add_argument("--pool-port", type=_positive_int, default=8765)
+    pool_configure.add_argument("--pool-provider-id", default="ai-auth-switch-pool")
+    pool_configure.add_argument("--pool-env-key", default="AI_AUTH_SWITCH_POOL_TOKEN")
+    pool_configure.add_argument(
+        "--pool-token-file",
+        default="~/.local/share/ai-auth-switch/pool/responses.token",
+    )
+    pool_configure.add_argument("--pool-no-backup", action="store_true")
+    pool_configure.set_defaults(func=_cmd_pool_configure)
+
+    pool_restore = pool_sub.add_parser(
+        "restore",
+        help="Restore a Codex config.toml from a pool-config backup.",
+    )
+    pool_restore.add_argument("pool_backup")
+    pool_restore.set_defaults(func=_cmd_pool_restore)
+
+    pool_status = pool_sub.add_parser(
+        "status", help="Show persistent pool leases, routes, and health."
+    )
+    pool_status.add_argument("--json", action="store_true")
+    pool_status.set_defaults(func=_cmd_pool_status)
+
     completion = subparsers.add_parser(
         "completion",
         help="Print a shell completion script for bash, zsh, or fish.",
@@ -1742,6 +2025,38 @@ def main(argv: Sequence[str] | None = None, *, program_name: str | None = None) 
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return 130
+
+
+def pool_app_server_main() -> int:
+    forwarded = list(sys.argv[1:])
+    if forwarded and forwarded[0] == "app-server":
+        forwarded.pop(0)
+    ignored_flags = {"--analytics-default-enabled", "--stdio", "--strict-config"}
+    ignored_with_value = {
+        "--listen",
+        "--code-mode-host",
+        "--enable",
+        "--disable",
+        "-c",
+        "--config",
+    }
+    filtered: list[str] = []
+    index = 0
+    while index < len(forwarded):
+        token = forwarded[index]
+        if token in ignored_flags:
+            index += 1
+            continue
+        if token in ignored_with_value:
+            index += 2
+            continue
+        filtered.append(token)
+        index += 1
+    return main(["pool", "app-server", *filtered], program_name="ai-auth-switch")
+
+
+def pool_responses_main() -> int:
+    return main(["pool", "responses", *sys.argv[1:]], program_name="ai-auth-switch")
 
 
 if __name__ == "__main__":

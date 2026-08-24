@@ -46,7 +46,9 @@ def _alias_names(ns: argparse.Namespace) -> list[str]:
         return []
 
 
-def _subparsers_action(parser: argparse.ArgumentParser) -> argparse._SubParsersAction | None:
+def _subparsers_action(
+    parser: argparse.ArgumentParser,
+) -> argparse._SubParsersAction | None:
     for action in parser._actions:
         if isinstance(action, argparse._SubParsersAction):
             return action
@@ -68,15 +70,17 @@ def _command_path(ns: argparse.Namespace) -> tuple[str, ...]:
                 ns, "desktop_auto_command", None
             ):
                 parts.append(ns.desktop_auto_command)
+            if ns.desktop_command == "pool" and getattr(
+                ns, "desktop_pool_command", None
+            ):
+                parts.append(ns.desktop_pool_command)
+        if command_name == "pool" and getattr(ns, "pool_command", None):
+            parts.append(ns.pool_command)
     return tuple(parts)
 
 
 def _option_strings(parser: argparse.ArgumentParser) -> list[str]:
-    return [
-        option
-        for action in parser._actions
-        for option in action.option_strings
-    ]
+    return [option for action in parser._actions for option in action.option_strings]
 
 
 def _positional_actions(parser: argparse.ArgumentParser) -> list[argparse.Action]:
@@ -115,12 +119,18 @@ def _dynamic_candidates(
     provider = getattr(ns, "provider", None)
     if path[0:1] == ("run",) and dest == "name" and provider:
         return _profile_names(provider, ns)
-    if path[0:1] == ("auth",) and path[1:2] in (
-        ("use",),
-        ("remove",),
-        ("default",),
-        ("bind",),
-    ) and dest == "name" and provider:
+    if (
+        path[0:1] == ("auth",)
+        and path[1:2]
+        in (
+            ("use",),
+            ("remove",),
+            ("default",),
+            ("bind",),
+        )
+        and dest == "name"
+        and provider
+    ):
         return _profile_names(provider, ns)
     if path == ("auth", "rename") and dest in ("old", "new") and provider:
         return _profile_names(provider, ns)
@@ -193,7 +203,9 @@ def complete_words(words: list[str]) -> list[str]:
     except (SystemExit, argparse.ArgumentError, CliUsageError):
         return []
     candidates = _candidates_for(parser, ns, consumed)
-    return sorted({candidate for candidate in candidates if candidate.startswith(prefix)})
+    return sorted(
+        {candidate for candidate in candidates if candidate.startswith(prefix)}
+    )
 
 
 def bash_completion_script() -> str:

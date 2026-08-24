@@ -27,6 +27,11 @@ python -m pip install --upgrade ai-auth-switch
 
 Python 3.10 or newer is required.
 
+The 0.6.0 release adds the local paid-account pool router, official custom
+provider configuration, app-server integration, and Linux Desktop pool
+launcher. The pool features are opt-in; existing `auth`, `run`, and desktop
+auto-rotation behavior remains unchanged until configured.
+
 To install the newest source directly from the official GitHub repository:
 
 ```bash
@@ -197,6 +202,111 @@ This is global idle rotation, not per-thread account assignment. All turns in
 one desktop app-server still share the selected account. The integration uses
 the app-server Unix-socket transport documented by OpenAI and requires a
 desktop build that exposes local-daemon mode.
+
+### Unified local account pool (experimental)
+
+The pool router keeps the normal Codex history and configuration shared while
+giving each backend its own saved OAuth profile. It excludes Free plans,
+expired credentials, and exhausted windows; reservations account for active
+requests, and a failed account is cooled down or marked expired. A request is
+never moved after response bytes have been sent. Before the first byte, 401,
+403, 429, and transient upstream failures can be retried on another paid
+account.
+
+For terminal clients and Codex configurations that support a custom Responses
+provider, start the loopback-only HTTP router:
+
+```bash
+ais-pool-responses
+# or: ais pool responses --pool-port 8765
+```
+
+Install the matching official Codex custom-provider block with an automatic
+backup of the existing config:
+
+```bash
+ais pool configure
+```
+
+Use `--codex-home`, `--pool-port`, `--pool-provider-id`, or
+`--pool-token-file` when those paths differ. The command changes only the
+active `model_provider` key and its dedicated `model_providers.<id>` section;
+the printed backup can be used to restore the previous file. Restart Codex
+Desktop or VS Code after changing the provider so their app-server reloads
+`config.toml`; terminal invocations read it on each new process.
+
+The command creates a private token file at
+`~/.local/share/ai-auth-switch/pool/responses.token` and prints the local
+endpoint. Put the token in an environment variable and add one custom
+provider to `~/.codex/config.toml`:
+
+```bash
+export AI_AUTH_SWITCH_POOL_TOKEN="$(cat ~/.local/share/ai-auth-switch/pool/responses.token)"
+```
+
+```toml
+model_provider = "ai-auth-switch-pool"
+
+[model_providers.ai-auth-switch-pool]
+name = "ai-auth-switch local account pool"
+base_url = "http://127.0.0.1:8765/v1"
+env_key = "AI_AUTH_SWITCH_POOL_TOKEN"
+wire_api = "responses"
+requires_openai_auth = false
+```
+
+The router binds only to `127.0.0.1` by default and rejects non-loopback
+listeners. It never writes access tokens to logs or forwards the local pool
+token upstream. Use `--pool-upstream-url` only for an explicitly compatible
+Responses endpoint; the default is the Codex ChatGPT backend.
+
+For app-server clients such as VS Code's Codex integration, use the stdio
+adapter so every started thread receives a sticky backend account:
+
+```bash
+ais-pool-app-server
+```
+
+Set the client's app-server executable to `ais-pool-app-server` (or launch
+`ais pool app-server` directly). For the OpenAI VS Code extension, the
+development-only setting is:
+
+```json
+{
+  "chatgpt.cliExecutable": "/home/me/.local/bin/ais-pool-app-server"
+}
+```
+
+The entrypoint accepts the extension's `app-server` and analytics arguments.
+Backend credentials are isolated in private
+temporary `CODEX_HOME` directories and shared Codex SQLite/session state is
+kept in the normal home. Desktop builds that only connect to their own managed
+daemon still support the existing `ais desktop auto` idle rotation. To make a
+Linux ChatGPT Desktop launcher inherit the pool token and route its daemon
+requests through the same custom provider, use:
+
+```bash
+ais desktop pool install
+```
+
+This creates a private launcher wrapper and a user service for
+`ais-pool-responses`, backs up the desktop entry and Codex config, and requires
+one Desktop restart. Inspect or disable it with:
+
+```bash
+ais desktop pool status
+ais desktop pool disable
+```
+
+If service startup fails, the launcher and Codex config are rolled back. The
+desktop pool integration is Linux-only; on other platforms use the local
+Responses endpoint and the client's supported custom-provider configuration.
+
+The pool state contains only leases, route bindings, health, and timestamps;
+credential material remains in the existing profile files. Stop the router with
+Ctrl-C; client requests already in flight finish or fail without switching
+accounts mid-stream. Inspect those non-secret state records with
+`ais pool status --json`.
 
 After Codex auth is saved, logged in, or switched, `ai-auth-switch` also syncs
 Codex-dependent local tools:
@@ -502,6 +612,8 @@ target machine.
 - Dependent sync: point Hermes and OpenClaw at the active Codex CLI auth.
 - Wrapper: run a command in a profile-scoped Codex or Claude config directory
   without changing the default active profile or blocking other accounts.
+- Pool router: select paid Codex profiles by live capacity, leases, route
+  stickiness, and health while keeping every credential in its profile store.
 
 Provider support is intentionally small. A provider only needs to define where
 its active auth file lives, how to infer a profile name, and which login command

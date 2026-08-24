@@ -18,7 +18,7 @@ from ai_auth_switch.store import AuthStore
 class CompletionTests(unittest.TestCase):
     def test_top_level_commands(self) -> None:
         candidates = complete_words([""])
-        for expected in ("auth", "alias", "desktop", "run", "completion"):
+        for expected in ("auth", "alias", "desktop", "pool", "run", "completion"):
             self.assertIn(expected, candidates)
         # Prefix filtering applies to the current word.
         self.assertIn("auth", complete_words(["a"]))
@@ -118,6 +118,13 @@ class CompletionTests(unittest.TestCase):
 
     def test_run_auto_option_completes_after_provider(self) -> None:
         self.assertIn("--auto", complete_words(["run", "codex", "--a"]))
+
+    def test_pool_app_server_subcommand_completes(self) -> None:
+        self.assertIn("app-server", complete_words(["pool", ""]))
+        self.assertIn("responses", complete_words(["pool", ""]))
+
+    def test_desktop_pool_subcommand_completes(self) -> None:
+        self.assertIn("install", complete_words(["desktop", "pool", ""]))
 
     def test_invalid_input_does_not_crash(self) -> None:
         self.assertEqual(complete_words(["auth", "not-a-command", ""]), [])
