@@ -50,6 +50,12 @@ the other mode underneath it.
 Version 0.6.5 accepts the OpenAI VS Code extension's `app-server` argument in
 any position, including after extension-specific flags.
 
+Version 0.6.6 corrects the local pool's Responses upstream to
+`/backend-api/codex/responses`, keeps the last good usage snapshot when a
+transient fetch fails, and defaults the pool provider id to `custom` so
+sessions stay on one stable provider. `auth list --usage` now lists free-plan
+accounts after paid ones.
+
 To install the newest source directly from the official GitHub repository:
 
 ```bash

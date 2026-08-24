@@ -61,7 +61,7 @@ class DesktopPoolTests(unittest.TestCase):
             self.assertIn("Conflicts=ai-auth-switch-desktop-auto.service", service_text)
             self.assertIn("Before=ai-auth-switch-desktop-auto.service", service_text)
             parsed = tomllib.loads(config.read_text(encoding="utf-8"))
-            self.assertEqual(parsed["model_provider"], "ai-auth-switch-pool")
+            self.assertEqual(parsed["model_provider"], "custom")
             self.assertIsNotNone(installed.config_backup)
             self.assertTrue(any("enable" in call for call in calls))
             self.assertTrue(

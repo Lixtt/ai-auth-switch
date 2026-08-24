@@ -35,8 +35,15 @@ from ai_auth_switch.store import (
     sanitize_profile_name,
     write_binding,
 )
+from ai_auth_switch.pool_config import POOL_PROVIDER_ID
 from ai_auth_switch.sync import SyncResult, sync_codex_dependents
-from ai_auth_switch.usage import fetch_profile_usage, format_usage, usage_to_dict
+from ai_auth_switch.usage import (
+    AccountUsage,
+    fetch_profile_usage,
+    format_usage,
+    is_free_plan,
+    usage_to_dict,
+)
 from ai_auth_switch.wrapper import run_with_profile
 
 SUPPORTED_PROVIDERS = ["codex", "claude"]
@@ -418,12 +425,18 @@ def _sync_automatic_alias_links(
 def _profile_sort_key(
     aliases_by_profile: dict[str, str],
     profile: ProfileInfo,
-) -> tuple[int, int | str]:
+    usages: dict[str, AccountUsage] | None = None,
+) -> tuple[int, int, int | str]:
     alias_name = aliases_by_profile.get(profile.name)
     if alias_name is not None:
         parts = numbered_alias_parts(alias_name)
-        return (0, parts[1] if parts is not None else 0)
-    return (1, profile.name)
+        alias_rank: tuple[int, int | str] = (0, parts[1] if parts is not None else 0)
+    else:
+        alias_rank = (1, profile.name)
+    free_rank = (
+        1 if usages is not None and is_free_plan(usages.get(profile.name)) else 0
+    )
+    return (free_rank, alias_rank[0], alias_rank[1])
 
 
 def _auth_hint(provider: Provider) -> str:
@@ -520,7 +533,7 @@ def _cmd_auth_list(args: argparse.Namespace) -> int:
         }
         profiles = sorted(
             profiles,
-            key=lambda p: _profile_sort_key(aliases_by_profile, p),
+            key=lambda p: _profile_sort_key(aliases_by_profile, p, usages),
         )
         if len(provider_ids) > 1:
             if index and not args.json:
@@ -1934,7 +1947,7 @@ def build_parser(
     pool_responses.add_argument("--pool-port", type=_positive_int, default=8765)
     pool_responses.add_argument(
         "--pool-upstream-url",
-        default="https://chatgpt.com/backend-api/responses",
+        default="https://chatgpt.com/backend-api/codex/responses",
     )
     pool_responses.add_argument("--pool-token-file")
     pool_responses.add_argument(
@@ -1961,7 +1974,7 @@ def build_parser(
         help="Install the loopback pool as the active Codex custom provider.",
     )
     pool_configure.add_argument("--pool-port", type=_positive_int, default=8765)
-    pool_configure.add_argument("--pool-provider-id", default="ai-auth-switch-pool")
+    pool_configure.add_argument("--pool-provider-id", default=POOL_PROVIDER_ID)
     pool_configure.add_argument("--pool-env-key", default="AI_AUTH_SWITCH_POOL_TOKEN")
     pool_configure.add_argument(
         "--pool-token-file",

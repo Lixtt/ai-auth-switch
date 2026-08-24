@@ -26,9 +26,9 @@ class PoolConfigTests(unittest.TestCase):
                 base_url="http://127.0.0.1:8765/v1",
             )
             parsed = tomllib.loads(config.read_text(encoding="utf-8"))
-            self.assertEqual(parsed["model_provider"], "ai-auth-switch-pool")
+            self.assertEqual(parsed["model_provider"], "custom")
             self.assertEqual(
-                parsed["model_providers"]["ai-auth-switch-pool"]["wire_api"],
+                parsed["model_providers"]["custom"]["wire_api"],
                 "responses",
             )
             self.assertEqual(parsed["model"], "gpt-5")

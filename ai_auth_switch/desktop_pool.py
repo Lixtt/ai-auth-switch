@@ -17,6 +17,7 @@ from ai_auth_switch.desktop import (
 )
 from ai_auth_switch.errors import AiAuthSwitchError
 from ai_auth_switch.pool_config import (
+    POOL_PROVIDER_ID,
     install_pool_provider,
     parse_toml,
     restore_codex_config,
@@ -297,7 +298,7 @@ def disable_desktop_pool(
         current_config = parse_toml(config_path.read_text(encoding="utf-8"))
     except (OSError, AiAuthSwitchError):
         current_config = {}
-    if current_config.get("model_provider") == "ai-auth-switch-pool":
+    if current_config.get("model_provider") == POOL_PROVIDER_ID:
         backups = sorted(
             config_path.parent.glob(".config.toml.ai-auth-switch-backup.*")
         )

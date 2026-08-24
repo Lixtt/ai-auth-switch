@@ -25,7 +25,7 @@ from ai_auth_switch.utils import (
     set_private_permissions,
 )
 
-DEFAULT_RESPONSES_UPSTREAM = "https://chatgpt.com/backend-api/responses"
+DEFAULT_RESPONSES_UPSTREAM = "https://chatgpt.com/backend-api/codex/responses"
 DEFAULT_LISTEN_HOST = "127.0.0.1"
 DEFAULT_LISTEN_PORT = 8765
 MAX_REQUEST_BYTES = 32 * 1024 * 1024

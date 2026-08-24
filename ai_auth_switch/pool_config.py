@@ -17,7 +17,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10
 from ai_auth_switch.errors import AiAuthSwitchError
 from ai_auth_switch.utils import atomic_write, set_private_permissions
 
-POOL_PROVIDER_ID = "ai-auth-switch-pool"
+POOL_PROVIDER_ID = "custom"
 POOL_TOKEN_ENV = "AI_AUTH_SWITCH_POOL_TOKEN"
 _PROVIDER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 

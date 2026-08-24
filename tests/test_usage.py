@@ -166,6 +166,50 @@ class UsageTests(unittest.TestCase):
             self.assertEqual(third["one"].plan_type, "plan-2")
             self.assertEqual(len(calls), 2)
 
+    def test_failed_refresh_keeps_last_good_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auth = root / "auth.json"
+            auth.write_text('{"version": 1}')
+            calls = []
+
+            def fetcher(path, *, timeout):
+                calls.append(path.read_text())
+                if len(calls) >= 2:
+                    raise RuntimeError("boom")
+                return AccountUsage(plan_type="good")
+
+            kwargs = {
+                "cache_dir": root / "cache",
+                "fetcher": fetcher,
+                "refresh": True,
+            }
+            first = fetch_profile_usage([("one", auth)], **kwargs)
+            self.assertEqual(first["one"].plan_type, "good")
+
+            second = fetch_profile_usage([("one", auth)], **kwargs)
+            # A failed refresh must fall back to the last good snapshot rather
+            # than stranding a healthy account with a transient error.
+            self.assertEqual(second["one"].plan_type, "good")
+            self.assertIsNone(second["one"].error)
+
+    def test_profile_sort_puts_free_after_paid(self) -> None:
+        from ai_auth_switch.cli import _profile_sort_key
+        from ai_auth_switch.store import ProfileInfo
+
+        aliases = {"free": "codex1", "paid": "codex2"}
+        free = ProfileInfo("free", Path("free.json"))
+        paid = ProfileInfo("paid", Path("paid.json"))
+        usages = {
+            "free": AccountUsage(plan_type="free"),
+            "paid": AccountUsage(plan_type="pro"),
+        }
+        # free has the smaller alias index, but paid must still sort first.
+        self.assertLess(
+            _profile_sort_key(aliases, paid, usages),
+            _profile_sort_key(aliases, free, usages),
+        )
+
     def test_cli_list_usage_formats_each_profile(self) -> None:
         from ai_auth_switch.cli import main
 

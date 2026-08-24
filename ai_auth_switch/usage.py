@@ -170,10 +170,24 @@ def fetch_profile_usage(
         for future in as_completed(pending):
             name, path = pending[future]
             try:
-                results[name] = future.result()
+                usage = future.result()
             except Exception as exc:
-                results[name] = AccountUsage(error=f"request failed: {exc}")
-            _write_cache(cache_dir, name, path, results[name])
+                usage = AccountUsage(error=f"request failed: {exc}")
+            if usage.error is not None:
+                # A failed usage refresh must not erase a healthy account from
+                # the pool: keep the last good snapshot (ignoring TTL) so a
+                # transient usage-endpoint failure or a spurious 401/403 does
+                # not strand an otherwise-valid account. Definitive failures are
+                # handled by the pool health tracker on real upstream request
+                # failures, not by usage fetching.
+                previous = _read_cache(cache_dir, name, path, ttl=float("inf"))
+                if previous is not None and previous.error is None:
+                    usage = previous
+                else:
+                    _write_cache(cache_dir, name, path, usage)
+            else:
+                _write_cache(cache_dir, name, path, usage)
+            results[name] = usage
     return results
 
 
