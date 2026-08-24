@@ -32,6 +32,10 @@ provider configuration, app-server integration, and Linux Desktop pool
 launcher. The pool features are opt-in; existing `auth`, `run`, and desktop
 auto-rotation behavior remains unchanged until configured.
 
+Version 0.6.1 refines upstream 403 handling so malformed or policy-rejected
+Responses requests cool down an account without incorrectly marking its OAuth
+credentials as permanently expired.
+
 To install the newest source directly from the official GitHub repository:
 
 ```bash

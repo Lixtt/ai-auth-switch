@@ -341,13 +341,13 @@ class PoolResponsesProxy:
                         and attempt < self.config.max_retries
                     ):
                         last_retry_response = (status, response_headers, error_body)
-                        kind = str(status) if status in {401, 403} else "upstream"
+                        kind = "401" if status == 401 else "upstream"
                         self.coordinator.mark_failure(
                             reservation.profile, kind, f"upstream HTTP {status}"
                         )
                         continue
                     if status in RETRYABLE_STATUS_CODES:
-                        kind = str(status) if status in {401, 403} else "upstream"
+                        kind = "401" if status == 401 else "upstream"
                         self.coordinator.mark_failure(
                             reservation.profile, kind, f"upstream HTTP {status}"
                         )
@@ -370,7 +370,7 @@ class PoolResponsesProxy:
                 ):
                     retry_body = response.read(MAX_REQUEST_BYTES)
                     last_retry_response = (status, response_headers, retry_body)
-                    kind = str(status) if status in {401, 403} else "upstream"
+                    kind = "401" if status == 401 else "upstream"
                     self.coordinator.mark_failure(
                         reservation.profile, kind, f"upstream HTTP {status}"
                     )

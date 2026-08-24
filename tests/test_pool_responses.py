@@ -278,6 +278,37 @@ class PoolResponsesTests(unittest.TestCase):
             result = proxy.forward(b"{}", {})
             self.assertEqual(result.status, 429)
 
+    def test_forbidden_response_enters_cooldown_not_auth_expired(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            store.write_profile_content(
+                provider,
+                "a",
+                json.dumps({"tokens": {"access_token": "token-a"}}),
+            )
+
+            def opener(request, **_kwargs):
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    403,
+                    "forbidden",
+                    {"Content-Type": "text/html"},
+                    None,
+                )
+
+            proxy = PoolResponsesProxy(
+                store,
+                provider,
+                config=ResponsesProxyConfig(max_retries=0),
+                opener=opener,
+                usage_fetcher=lambda _profiles, **_kwargs: {"a": usage(80)},
+            )
+            self.assertEqual(proxy.forward(b"{}", {}).status, 403)
+            self.assertEqual(proxy.coordinator.load().health["a"].status, "cooldown")
+
     def test_http_handler_streams_sse_and_requires_local_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
