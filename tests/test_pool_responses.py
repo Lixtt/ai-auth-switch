@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 import urllib.error
@@ -18,7 +19,11 @@ from ai_auth_switch.pool_responses import (
 )
 from ai_auth_switch.providers.codex import CodexProvider
 from ai_auth_switch.store import AuthStore
-from ai_auth_switch.usage import AccountUsage, UsageWindow
+from ai_auth_switch.usage import (
+    AccountUsage,
+    UsageWindow,
+    fetch_profile_usage,
+)
 
 
 class FakeResponse:
@@ -247,6 +252,438 @@ class PoolResponsesTests(unittest.TestCase):
                 ["Bearer token-a", "Bearer token-b"],
             )
 
+    def test_retry_moves_after_retryable_response_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            for name in ("a", "b"):
+                store.write_profile_content(
+                    provider,
+                    name,
+                    json.dumps({"tokens": {"access_token": f"token-{name}"}}),
+                )
+            requests: list[urllib.request.Request] = []
+            attempts = 0
+
+            def opener(request, **_kwargs):
+                nonlocal attempts
+                attempts += 1
+                requests.append(request)
+                if attempts == 1:
+                    response = FakeResponse(b"retry")
+                    response.status = 503
+                    return response
+                return FakeResponse(b"ok")
+
+            proxy = PoolResponsesProxy(
+                store,
+                provider,
+                config=ResponsesProxyConfig(max_retries=1),
+                opener=opener,
+                usage_fetcher=lambda _profiles, **_kwargs: {
+                    "a": usage(80),
+                    "b": usage(70),
+                },
+            )
+            result = proxy.forward(b"{}", {})
+
+            self.assertEqual(result.status, 200)
+            self.assertEqual(
+                [item.get_header("Authorization") for item in requests],
+                ["Bearer token-a", "Bearer token-b"],
+            )
+
+    def test_retry_moves_after_network_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            for name in ("a", "b"):
+                store.write_profile_content(
+                    provider,
+                    name,
+                    json.dumps({"tokens": {"access_token": f"token-{name}"}}),
+                )
+            requests: list[urllib.request.Request] = []
+            attempts = 0
+
+            def opener(request, **_kwargs):
+                nonlocal attempts
+                attempts += 1
+                requests.append(request)
+                if attempts == 1:
+                    raise urllib.error.URLError("temporary outage")
+                return FakeResponse(b"ok")
+
+            proxy = PoolResponsesProxy(
+                store,
+                provider,
+                config=ResponsesProxyConfig(max_retries=1),
+                opener=opener,
+                usage_fetcher=lambda _profiles, **_kwargs: {
+                    "a": usage(80),
+                    "b": usage(70),
+                },
+            )
+            result = proxy.forward(b"{}", {})
+
+            self.assertEqual(result.status, 200)
+            self.assertEqual(
+                [item.get_header("Authorization") for item in requests],
+                ["Bearer token-a", "Bearer token-b"],
+            )
+
+    def test_unhealthy_sticky_route_migrates_before_upstream_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            for name in ("a", "b"):
+                store.write_profile_content(
+                    provider,
+                    name,
+                    json.dumps({"tokens": {"access_token": f"token-{name}"}}),
+                )
+
+            requests: list[urllib.request.Request] = []
+            usage_calls = 0
+
+            def opener(request, **_kwargs):
+                requests.append(request)
+                return FakeResponse(b"ok")
+
+            def usage_fetcher(_profiles, **_kwargs):
+                nonlocal usage_calls
+                usage_calls += 1
+                return {"a": usage(90), "b": usage(80)}
+
+            proxy = PoolResponsesProxy(
+                store,
+                provider,
+                config=ResponsesProxyConfig(max_retries=0),
+                opener=opener,
+                usage_fetcher=usage_fetcher,
+            )
+            initial = proxy.coordinator.reserve(
+                proxy.store.list_profiles(provider),
+                {"a": usage(90), "b": usage(80)},
+                route_key="turn-1",
+                owner="pid:100",
+                now=10,
+            )
+            proxy.coordinator.release(initial)
+            proxy.coordinator.mark_failure("a", "401", "expired", now=11)
+            result = proxy.forward(b"{}", {}, route_key="turn-1")
+
+            self.assertEqual(result.status, 200)
+            self.assertEqual(usage_calls, 1)
+            self.assertEqual(
+                [item.get_header("Authorization") for item in requests],
+                ["Bearer token-b"],
+            )
+            self.assertEqual(
+                proxy.coordinator.load().routes["turn-1"].profile,
+                "b",
+            )
+
+    def test_healthy_sticky_route_stays_on_bound_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            for name in ("a", "b"):
+                store.write_profile_content(
+                    provider,
+                    name,
+                    json.dumps({"tokens": {"access_token": f"token-{name}"}}),
+                )
+            requests: list[urllib.request.Request] = []
+
+            def opener(request, **_kwargs):
+                requests.append(request)
+                return FakeResponse(b"ok")
+
+            proxy = PoolResponsesProxy(
+                store,
+                provider,
+                config=ResponsesProxyConfig(max_retries=0),
+                opener=opener,
+                usage_fetcher=lambda _profiles, **_kwargs: {
+                    "a": usage(20),
+                    "b": usage(90),
+                },
+            )
+            initial = proxy.coordinator.reserve(
+                proxy.store.list_profiles(provider),
+                {"a": usage(20), "b": usage(90)},
+                route_key="turn-1",
+                owner="pid:100",
+                now=10,
+            )
+            self.assertEqual(initial.profile, "b")
+            proxy.coordinator.release(initial)
+
+            # Make the bound account look less attractive; stickiness must
+            # still win while it remains healthy.
+            proxy.usage_fetcher = lambda _profiles, **_kwargs: {
+                "a": usage(90),
+                "b": usage(1),
+            }
+            result = proxy.forward(b"{}", {}, route_key="turn-1")
+
+            self.assertEqual(result.status, 200)
+            self.assertEqual(
+                [item.get_header("Authorization") for item in requests],
+                ["Bearer token-b"],
+            )
+
+    def test_removed_sticky_profile_migrates_before_upstream_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            for name in ("a", "b"):
+                store.write_profile_content(
+                    provider,
+                    name,
+                    json.dumps({"tokens": {"access_token": f"token-{name}"}}),
+                )
+            requests: list[urllib.request.Request] = []
+
+            def opener(request, **_kwargs):
+                requests.append(request)
+                return FakeResponse(b"ok")
+
+            proxy = PoolResponsesProxy(
+                store,
+                provider,
+                config=ResponsesProxyConfig(max_retries=0),
+                opener=opener,
+                usage_fetcher=lambda _profiles, **_kwargs: {"b": usage(80)},
+            )
+            initial = proxy.coordinator.reserve(
+                proxy.store.list_profiles(provider),
+                {"a": usage(90), "b": usage(80)},
+                route_key="turn-1",
+                owner="pid:100",
+                now=10,
+            )
+            self.assertEqual(initial.profile, "a")
+            proxy.coordinator.release(initial)
+            store.profile_path(provider, "a").unlink()
+
+            result = proxy.forward(b"{}", {}, route_key="turn-1")
+
+            self.assertEqual(result.status, 200)
+            self.assertEqual(
+                [item.get_header("Authorization") for item in requests],
+                ["Bearer token-b"],
+            )
+
+    def test_concurrent_sticky_recovery_converges_on_one_migrated_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            for name in ("a", "b", "c"):
+                store.write_profile_content(
+                    provider,
+                    name,
+                    json.dumps({"tokens": {"access_token": f"token-{name}"}}),
+                )
+            requests: list[urllib.request.Request] = []
+            entered = Barrier(2)
+            release = Event()
+
+            class BlockingResponse(FakeResponse):
+                def read(self, _size: int = -1) -> bytes:
+                    if not self.sent:
+                        self.sent = True
+                        entered.wait(timeout=5)
+                        release.wait(timeout=5)
+                        return self.body
+                    return b""
+
+            def opener(request, **_kwargs):
+                requests.append(request)
+                return BlockingResponse(b"ok")
+
+            usage_map = {
+                "a": usage(90),
+                "b": usage(80),
+                "c": usage(20),
+            }
+            proxy = PoolResponsesProxy(
+                store,
+                provider,
+                config=ResponsesProxyConfig(max_retries=0),
+                opener=opener,
+                usage_fetcher=lambda _profiles, **_kwargs: usage_map,
+            )
+            initial = proxy.coordinator.reserve(
+                proxy.store.list_profiles(provider),
+                usage_map,
+                route_key="turn-1",
+                owner=f"pid:{os.getpid()}",
+                now=10,
+            )
+            proxy.coordinator.release(initial)
+            proxy.coordinator.mark_failure("a", "401", "expired", now=11)
+
+            results: list[bytes] = []
+
+            def run() -> None:
+                results.append(proxy.forward(b"{}", {}, route_key="turn-1").body)
+
+            threads = [Thread(target=run), Thread(target=run)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=0.2)
+            release.set()
+            for thread in threads:
+                thread.join(timeout=5)
+
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertEqual(results, [b"ok", b"ok"])
+            self.assertEqual(
+                {request.get_header("Authorization") for request in requests},
+                {"Bearer token-b"},
+            )
+
+    def test_expired_usage_snapshot_migrates_sticky_route(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            for name in ("a", "b"):
+                store.write_profile_content(
+                    provider,
+                    name,
+                    json.dumps({"tokens": {"access_token": f"token-{name}"}}),
+                )
+            profiles = store.list_profiles(provider)
+            cache_dir = store.base_dir / "cache" / "usage" / provider.id
+            fetch_profile_usage(
+                ((profile.name, profile.path) for profile in profiles),
+                cache_dir=cache_dir,
+                refresh=True,
+                fetcher=lambda _path, **_kwargs: usage(90),
+            )
+
+            initial = PoolResponsesProxy(
+                store,
+                provider,
+                config=ResponsesProxyConfig(max_retries=0),
+                usage_fetcher=lambda _profiles, **_kwargs: {
+                    "a": usage(90),
+                    "b": usage(80),
+                },
+                opener=lambda _request, **_kwargs: FakeResponse(b"ok"),
+            )
+            selected = initial.coordinator.reserve(
+                profiles,
+                {"a": usage(90), "b": usage(80)},
+                route_key="turn-1",
+                owner="pid:100",
+                now=10,
+            )
+            self.assertEqual(selected.profile, "a")
+            initial.coordinator.release(selected)
+
+            requests: list[urllib.request.Request] = []
+
+            def opener(request, **_kwargs):
+                requests.append(request)
+                return FakeResponse(b"ok")
+
+            def expired_fetcher(path, **_kwargs):
+                if path.stem == "a":
+                    return AccountUsage(error="authentication expired")
+                return usage(80)
+
+            proxy = PoolResponsesProxy(
+                store,
+                provider,
+                config=ResponsesProxyConfig(max_retries=0),
+                opener=opener,
+                usage_fetcher=lambda profile_items, **kwargs: fetch_profile_usage(
+                    profile_items,
+                    cache_dir=cache_dir,
+                    refresh=True,
+                    fetcher=expired_fetcher,
+                    **{
+                        key: value
+                        for key, value in kwargs.items()
+                        if key in {"timeout", "workers"}
+                    },
+                ),
+            )
+            result = proxy.forward(b"{}", {}, route_key="turn-1")
+
+            self.assertEqual(result.status, 200)
+            self.assertEqual(
+                [item.get_header("Authorization") for item in requests],
+                ["Bearer token-b"],
+            )
+
+    def test_auth_failure_for_rotated_old_token_does_not_strand_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            for name in ("a", "b"):
+                store.write_profile_content(
+                    provider,
+                    name,
+                    json.dumps({"tokens": {"access_token": f"old-{name}"}}),
+                )
+            attempts = 0
+
+            def opener(request, **_kwargs):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    # Simulate Codex rotating the profile while the old token
+                    # request is still in flight.
+                    store.profile_path(provider, "a").write_text(
+                        json.dumps({"tokens": {"access_token": "new-a"}}),
+                        encoding="utf-8",
+                    )
+                    raise urllib.error.HTTPError(
+                        request.full_url,
+                        401,
+                        "expired old token",
+                        {},
+                        None,
+                    )
+                return FakeResponse(b"ok")
+
+            proxy = PoolResponsesProxy(
+                store,
+                provider,
+                config=ResponsesProxyConfig(max_retries=0),
+                opener=opener,
+                usage_fetcher=lambda _profiles, **_kwargs: {
+                    "a": usage(90),
+                    "b": usage(20),
+                },
+            )
+            first = proxy.forward(b"{}", {})
+            self.assertEqual(first.status, 401)
+            second = proxy.forward(b"{}", {})
+            self.assertEqual(second.status, 200)
+            self.assertEqual(attempts, 2)
+
     def test_retryable_status_is_preserved_when_no_other_account_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -277,6 +714,46 @@ class PoolResponsesTests(unittest.TestCase):
             )
             result = proxy.forward(b"{}", {})
             self.assertEqual(result.status, 429)
+
+    def test_unhealthy_sticky_route_stays_503_without_any_healthy_account(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            store.write_profile_content(
+                provider,
+                "a",
+                json.dumps({"tokens": {"access_token": "token-a"}}),
+            )
+            requests: list[urllib.request.Request] = []
+
+            def opener(request, **_kwargs):
+                requests.append(request)
+                return FakeResponse(b"unexpected")
+
+            proxy = PoolResponsesProxy(
+                store,
+                provider,
+                config=ResponsesProxyConfig(max_retries=0),
+                opener=opener,
+                usage_fetcher=lambda _profiles, **_kwargs: {
+                    "a": AccountUsage(error="authentication expired"),
+                },
+            )
+            initial = proxy.coordinator.reserve(
+                proxy.store.list_profiles(provider),
+                {"a": usage(90)},
+                route_key="turn-1",
+                owner="pid:100",
+                now=10,
+            )
+            proxy.coordinator.release(initial)
+            proxy.coordinator.mark_failure("a", "401", "expired", now=11)
+
+            with self.assertRaisesRegex(AiAuthSwitchError, "no eligible paid account"):
+                proxy.forward(b"{}", {}, route_key="turn-1")
+            self.assertEqual(requests, [])
 
     def test_forbidden_response_enters_cooldown_not_auth_expired(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

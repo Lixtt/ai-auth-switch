@@ -5,16 +5,27 @@ import json
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any
 
 from ai_auth_switch import __version__
 from ai_auth_switch.utils import atomic_write, extract_account_id_from_jwt
 
 DEFAULT_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+AUTH_EXPIRED_ERROR = "authentication expired"
+
+
+def _is_auth_expired_error(error: str | None) -> bool:
+    if not isinstance(error, str):
+        return False
+    normalized = error.strip().casefold()
+    return normalized == AUTH_EXPIRED_ERROR or normalized.startswith(
+        f"{AUTH_EXPIRED_ERROR}:"
+    )
 
 
 @dataclass(frozen=True)
@@ -128,7 +139,7 @@ def fetch_usage(
         return parse_usage(data)
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
-            return AccountUsage(error="authentication expired")
+            return AccountUsage(error=AUTH_EXPIRED_ERROR)
         return AccountUsage(error=f"HTTP {exc.code}")
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         reason = getattr(exc, "reason", exc)
@@ -171,22 +182,32 @@ def fetch_profile_usage(
             name, path = pending[future]
             try:
                 usage = future.result()
+            except urllib.error.HTTPError as exc:
+                # Keep the same definitive classification as ``fetch_usage``
+                # for custom fetchers that let HTTP errors escape.
+                if exc.code in (401, 403):
+                    usage = AccountUsage(error=AUTH_EXPIRED_ERROR)
+                else:
+                    usage = AccountUsage(error=f"request failed: {exc}")
             except Exception as exc:
                 usage = AccountUsage(error=f"request failed: {exc}")
-            if usage.error is not None:
-                # A failed usage refresh must not erase a healthy account from
-                # the pool: keep the last good snapshot (ignoring TTL) so a
-                # transient usage-endpoint failure or a spurious 401/403 does
-                # not strand an otherwise-valid account. Definitive failures are
-                # handled by the pool health tracker on real upstream request
-                # failures, not by usage fetching.
+            if usage.error is None:
+                _write_cache(cache_dir, name, path, usage)
+            elif _is_auth_expired_error(usage.error):
+                # Authentication expiry is definitive: replacing a previous
+                # success prevents a stale plan/quota snapshot from making an
+                # expired account look usable until its auth file changes.
+                _write_cache(cache_dir, name, path, usage)
+            else:
+                # A transient usage refresh failure must not erase a healthy
+                # account from the pool: keep the last good snapshot (ignoring
+                # TTL). Do not rewrite that fallback, so repeated outages do
+                # not extend the age of stale usage indefinitely.
                 previous = _read_cache(cache_dir, name, path, ttl=float("inf"))
                 if previous is not None and previous.error is None:
                     usage = previous
                 else:
                     _write_cache(cache_dir, name, path, usage)
-            else:
-                _write_cache(cache_dir, name, path, usage)
             results[name] = usage
     return results
 

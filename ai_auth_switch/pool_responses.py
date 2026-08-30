@@ -17,7 +17,7 @@ from typing import Any
 from ai_auth_switch.errors import AiAuthSwitchError
 from ai_auth_switch.pool import PoolCoordinator, PoolReservation
 from ai_auth_switch.providers import Provider
-from ai_auth_switch.store import AuthStore, ProfileInfo
+from ai_auth_switch.store import AuthStore, ProfileInfo, sha256_file
 from ai_auth_switch.usage import AccountUsage, fetch_profile_usage
 from ai_auth_switch.utils import (
     atomic_write,
@@ -216,9 +216,22 @@ class PoolResponsesProxy:
         return profiles, usages
 
     def _reserve(
-        self, route_key: str | None, *, migrate: bool = False
+        self,
+        route_key: str | None,
+        *,
+        migrate: bool = False,
+        recover_sticky: bool = False,
     ) -> PoolReservation:
         profiles, usages = self._profiles_and_usage()
+        if recover_sticky:
+            return self.coordinator.reserve(
+                profiles,
+                usages,
+                route_key=route_key,
+                allow_migrate=migrate,
+                recover_sticky=True,
+                owner=f"pid:{os.getpid()}",
+            )
         return self.coordinator.reserve(
             profiles,
             usages,
@@ -247,6 +260,12 @@ class PoolResponsesProxy:
             method="POST",
         )
         return self.opener(request, timeout=self.config.request_timeout)
+
+    def _profile_auth_fingerprint(self, profile: str) -> str | None:
+        try:
+            return sha256_file(self.store.profile_path(self.provider, profile))
+        except OSError:
+            return None
 
     def forward(
         self,
@@ -292,18 +311,34 @@ class PoolResponsesProxy:
             return
         last_error: str | None = None
         last_retry_response: tuple[int, dict[str, str], bytes] | None = None
+
+        def emit_last_retry_response() -> bool:
+            if last_retry_response is None:
+                return False
+            status, response_headers, retry_body = last_retry_response
+            on_headers(status, response_headers)
+            on_chunk(retry_body)
+            return True
+
         for attempt in range(self.config.max_retries + 1):
             try:
-                reservation = self._reserve(route_key, migrate=attempt > 0)
+                reservation = self._reserve(
+                    route_key,
+                    migrate=attempt > 0,
+                    recover_sticky=bool(route_key and attempt == 0),
+                )
             except AiAuthSwitchError:
-                if last_retry_response is not None:
-                    status, response_headers, retry_body = last_retry_response
-                    on_headers(status, response_headers)
-                    on_chunk(retry_body)
+                # A persisted sticky route can outlive the account it points
+                # at (for example after a 401 marks that profile expired).
+                # Reservation recovery is handled atomically by the
+                # ``recover_sticky`` mode above; if it still fails, preserve
+                # the prior upstream retry response when one exists.
+                if emit_last_retry_response():
                     return
                 raise
             response = None
             headers_sent = False
+            auth_fingerprint = self._profile_auth_fingerprint(reservation.profile)
             try:
                 try:
                     response = self._open_upstream(body, headers, reservation)
@@ -320,7 +355,10 @@ class PoolResponsesProxy:
                 except AiAuthSwitchError as exc:
                     last_error = str(exc)
                     self.coordinator.mark_failure(
-                        reservation.profile, "auth", last_error
+                        reservation.profile,
+                        "auth",
+                        last_error,
+                        auth_fingerprint=auth_fingerprint,
                     )
                     if attempt < self.config.max_retries:
                         continue
@@ -331,7 +369,7 @@ class PoolResponsesProxy:
                     status = int(exc.code)
                     response_headers = {
                         key: value
-                        for key, value in exc.headers.items()
+                        for key, value in (exc.headers or {}).items()
                         if key.casefold()
                         not in {"content-length", "transfer-encoding", "connection"}
                     }
@@ -343,13 +381,19 @@ class PoolResponsesProxy:
                         last_retry_response = (status, response_headers, error_body)
                         kind = "401" if status == 401 else "upstream"
                         self.coordinator.mark_failure(
-                            reservation.profile, kind, f"upstream HTTP {status}"
+                            reservation.profile,
+                            kind,
+                            f"upstream HTTP {status}",
+                            auth_fingerprint=auth_fingerprint,
                         )
                         continue
                     if status in RETRYABLE_STATUS_CODES:
                         kind = "401" if status == 401 else "upstream"
                         self.coordinator.mark_failure(
-                            reservation.profile, kind, f"upstream HTTP {status}"
+                            reservation.profile,
+                            kind,
+                            f"upstream HTTP {status}",
+                            auth_fingerprint=auth_fingerprint,
                         )
                     on_headers(status, response_headers)
                     on_chunk(error_body)
@@ -357,7 +401,10 @@ class PoolResponsesProxy:
                 except (urllib.error.URLError, TimeoutError, OSError) as exc:
                     last_error = str(getattr(exc, "reason", exc))
                     self.coordinator.mark_failure(
-                        reservation.profile, "network", last_error
+                        reservation.profile,
+                        "network",
+                        last_error,
+                        auth_fingerprint=auth_fingerprint,
                     )
                     if attempt < self.config.max_retries:
                         continue
@@ -372,7 +419,10 @@ class PoolResponsesProxy:
                     last_retry_response = (status, response_headers, retry_body)
                     kind = "401" if status == 401 else "upstream"
                     self.coordinator.mark_failure(
-                        reservation.profile, kind, f"upstream HTTP {status}"
+                        reservation.profile,
+                        kind,
+                        f"upstream HTTP {status}",
+                        auth_fingerprint=auth_fingerprint,
                     )
                     continue
                 headers_sent = True
@@ -387,7 +437,10 @@ class PoolResponsesProxy:
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 last_error = str(getattr(exc, "reason", exc))
                 self.coordinator.mark_failure(
-                    reservation.profile, "network", last_error
+                    reservation.profile,
+                    "network",
+                    last_error,
+                    auth_fingerprint=auth_fingerprint,
                 )
                 if not headers_sent and attempt < self.config.max_retries:
                     continue

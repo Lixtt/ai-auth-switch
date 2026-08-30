@@ -5,13 +5,13 @@ import os
 import secrets
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from ai_auth_switch.errors import AiAuthSwitchError
 from ai_auth_switch.providers import Provider
-from ai_auth_switch.store import AuthStore, ProfileInfo
+from ai_auth_switch.store import AuthStore, ProfileInfo, sha256_file
 from ai_auth_switch.usage import AccountUsage, is_free_plan
 from ai_auth_switch.utils import atomic_write
 
@@ -112,6 +112,7 @@ class PoolHealth:
     cooldown_until: float | None = None
     last_error: str | None = None
     updated_at: float = 0.0
+    auth_fingerprint: str | None = None
 
     @classmethod
     def from_dict(cls, value: object) -> PoolHealth:
@@ -132,6 +133,9 @@ class PoolHealth:
         updated_at = value.get("updated_at")
         if not isinstance(updated_at, (int, float)):
             updated_at = 0.0
+        auth_fingerprint = value.get("auth_fingerprint")
+        if not isinstance(auth_fingerprint, str) or not auth_fingerprint.strip():
+            auth_fingerprint = None
         return cls(
             status=status,
             failure_count=failure_count,
@@ -140,16 +144,20 @@ class PoolHealth:
             else None,
             last_error=last_error,
             updated_at=float(updated_at),
+            auth_fingerprint=auth_fingerprint,
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "status": self.status,
             "failure_count": self.failure_count,
             "cooldown_until": self.cooldown_until,
             "last_error": self.last_error,
             "updated_at": self.updated_at,
         }
+        if self.auth_fingerprint is not None:
+            payload["auth_fingerprint"] = self.auth_fingerprint
+        return payload
 
 
 @dataclass
@@ -299,6 +307,54 @@ class PoolCoordinator:
             self.path, json.dumps(state.to_dict(), indent=2, sort_keys=True) + "\n"
         )
 
+    @staticmethod
+    def _profile_auth_fingerprint(profile: ProfileInfo) -> str | None:
+        try:
+            return sha256_file(profile.path)
+        except OSError:
+            return None
+
+    def _auth_fingerprint_for_name(self, profile: str) -> str | None:
+        return self._profile_auth_fingerprint(
+            ProfileInfo(profile, self.store.profile_path(self.provider, profile))
+        )
+
+    def _health_after_auth_change(
+        self,
+        profile: ProfileInfo,
+        health: PoolHealth,
+        state: PoolState,
+        now: float,
+    ) -> PoolHealth:
+        """Recover an auth-expired profile only after its file changes.
+
+        Authentication failures remain sticky so a bad token is not retried on
+        every request. Codex can replace a profile's credentials after a fresh
+        login or token refresh, though, and that new credential must be allowed
+        back into the pool. Older state files have no fingerprint; for those,
+        initialize the fingerprint on first observation while preserving the
+        existing expired status.
+        """
+        if health.status != AUTH_EXPIRED:
+            return health
+        fingerprint = self._profile_auth_fingerprint(profile)
+        if fingerprint is None:
+            return health
+        if health.auth_fingerprint is None:
+            updated = replace(health, auth_fingerprint=fingerprint)
+            state.health[profile.name] = updated
+            return updated
+        if fingerprint == health.auth_fingerprint:
+            return health
+        updated = PoolHealth(
+            status=HEALTHY,
+            updated_at=now,
+            auth_fingerprint=fingerprint,
+        )
+        state.health[profile.name] = updated
+        state.selected_at.setdefault(profile.name, now)
+        return updated
+
     def _prune(self, state: PoolState, now: float) -> None:
         state.leases = [
             lease
@@ -317,6 +373,7 @@ class PoolCoordinator:
                     failure_count=health.failure_count,
                     last_error=health.last_error,
                     updated_at=now,
+                    auth_fingerprint=health.auth_fingerprint,
                 )
 
     def _candidate_list(
@@ -333,6 +390,12 @@ class PoolCoordinator:
         for profile in profiles:
             capacity = _usage_capacity(usages.get(profile.name))
             health = state.health.get(profile.name, PoolHealth())
+            health = self._health_after_auth_change(
+                profile,
+                health,
+                state,
+                now,
+            )
             if capacity is None or not _health_eligible(health, now):
                 continue
             remaining, resets_at = capacity
@@ -367,6 +430,7 @@ class PoolCoordinator:
         owner: str | None = None,
         now: float | None = None,
         allow_migrate: bool = False,
+        recover_sticky: bool = False,
     ) -> PoolReservation:
         timestamp = time.time() if now is None else now
         owner_id = owner or f"pid:{os.getpid()}"
@@ -375,7 +439,23 @@ class PoolCoordinator:
             state = self.load()
             self._prune(state, timestamp)
             candidates = self._candidate_list(profiles, usages, state, timestamp)
-            if route_key and not allow_migrate:
+            if route_key and recover_sticky:
+                # Reservation-stage recovery (used when a persisted sticky
+                # route points at an unhealthy account) must be atomic with
+                # the route update. If another worker has already migrated
+                # the route while this request was fetching usage, keep that
+                # newly healthy target instead of selecting a second account.
+                route = state.routes.get(route_key)
+                sticky = (
+                    next(
+                        (item for item in candidates if item.profile == route.profile),
+                        None,
+                    )
+                    if route is not None
+                    else None
+                )
+                candidate = sticky or (candidates[0] if candidates else None)
+            elif route_key and not allow_migrate:
                 route = state.routes.get(route_key)
                 if route is not None:
                     sticky = next(
@@ -467,6 +547,7 @@ class PoolCoordinator:
                 failure_count=0,
                 last_error=None,
                 updated_at=timestamp,
+                auth_fingerprint=self._auth_fingerprint_for_name(profile),
             )
             if previous.status != HEALTHY:
                 state.selected_at.setdefault(profile, timestamp)
@@ -479,18 +560,25 @@ class PoolCoordinator:
         message: str,
         *,
         now: float | None = None,
+        auth_fingerprint: str | None = None,
     ) -> None:
         timestamp = time.time() if now is None else now
         with self.store.lock():
             state = self.load()
             previous = state.health.get(profile, PoolHealth())
             count = previous.failure_count + 1
+            fingerprint = (
+                auth_fingerprint
+                if auth_fingerprint is not None
+                else self._auth_fingerprint_for_name(profile)
+            )
             if kind in {"401", "403", "auth"}:
                 health = PoolHealth(
                     status=AUTH_EXPIRED,
                     failure_count=count,
                     last_error=message,
                     updated_at=timestamp,
+                    auth_fingerprint=fingerprint,
                 )
             elif kind == "disabled":
                 health = PoolHealth(
@@ -498,6 +586,7 @@ class PoolCoordinator:
                     failure_count=count,
                     last_error=message,
                     updated_at=timestamp,
+                    auth_fingerprint=fingerprint,
                 )
             else:
                 cooldown = min(
@@ -510,6 +599,7 @@ class PoolCoordinator:
                     cooldown_until=timestamp + cooldown,
                     last_error=message,
                     updated_at=timestamp,
+                    auth_fingerprint=fingerprint,
                 )
             state.health[profile] = health
             self.save(state)

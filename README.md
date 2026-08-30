@@ -56,6 +56,10 @@ transient fetch fails, and defaults the pool provider id to `custom` so
 sessions stay on one stable provider. `auth list --usage` now lists free-plan
 accounts after paid ones.
 
+Version 0.6.7 prevents expired usage snapshots from retaining stale plan
+labels, recovers persisted sticky routes when their account becomes
+unhealthy, and restores accounts automatically after their credentials rotate.
+
 To install the newest source directly from the official GitHub repository:
 
 ```bash
@@ -129,6 +133,10 @@ Results are cached for 60 seconds. Use `--refresh-usage` to bypass the cache,
 inline without hiding results for the other accounts. The command deliberately
 does not refresh expired OAuth tokens; run that profile through Codex or log in
 again so rotating credentials remain coordinated safely.
+
+Authentication-expired responses replace any cached plan/quota snapshot, so an
+expired account is shown as unavailable instead of retaining a stale `pro` or
+`free` label.
 
 For status bars, monitoring, or account schedulers, add `--json`. The JSON
 contains profile identity, active/alias state, and structured usage windows
@@ -237,6 +245,11 @@ never moved after response bytes have been sent. Before the first byte, 401,
 403, 429, and transient upstream failures can be retried on another paid
 account.
 
+Persisted thread routes are recovered in the same way: if their previous
+account is expired, removed, or otherwise unhealthy, the next request migrates
+the route atomically to a healthy account. A profile marked auth-expired is
+eligible again after its credentials file changes (for example, after login).
+
 For terminal clients and Codex configurations that support a custom Responses
 provider, start the loopback-only HTTP router:
 
@@ -269,9 +282,9 @@ export AI_AUTH_SWITCH_POOL_TOKEN="$(cat ~/.local/share/ai-auth-switch/pool/respo
 ```
 
 ```toml
-model_provider = "ai-auth-switch-pool"
+model_provider = "custom"
 
-[model_providers.ai-auth-switch-pool]
+[model_providers.custom]
 name = "ai-auth-switch local account pool"
 base_url = "http://127.0.0.1:8765/v1"
 env_key = "AI_AUTH_SWITCH_POOL_TOKEN"
@@ -283,6 +296,13 @@ The router binds only to `127.0.0.1` by default and rejects non-loopback
 listeners. It never writes access tokens to logs or forwards the local pool
 token upstream. Use `--pool-upstream-url` only for an explicitly compatible
 Responses endpoint; the default is the Codex ChatGPT backend.
+
+Once the router is running and `AI_AUTH_SWITCH_POOL_TOKEN` is exported, start
+the regular `codex` command. In this mode the pool custom provider chooses the
+account for each request; `codexN` aliases only select saved OAuth files and do
+not control the pool's backend choice. For an external Codex provider, keep
+its `model_providers.<id>` block and required `env_key` in `config.toml`;
+`auth use codex` only switches official Codex OAuth profiles.
 
 For app-server clients such as VS Code's Codex integration, use the stdio
 adapter so every started thread receives a sticky backend account:
@@ -526,6 +546,19 @@ OAuth credentials. `claudeN` and `run claude` remove those overrides in the
 child process so the selected OAuth profile wins. For permanent `auth use`
 switches, unset those variables in your shell. API-key, Bedrock, Vertex,
 Foundry, and `apiKeyHelper` profiles are not copied or managed.
+
+To use a custom Claude endpoint, provide its endpoint and credential in the
+environment and invoke Claude Code directly, for example:
+
+```bash
+export ANTHROPIC_BASE_URL="https://your-provider.example/v1"
+export ANTHROPIC_AUTH_TOKEN="..."
+claude
+```
+
+`claudeN` and `ai-auth-switch run claude ...` intentionally remove those
+credential overrides so a saved Claude OAuth profile wins; use the direct
+`claude` command (or your own environment wrapper) for custom providers.
 
 Use a non-default config directory when needed:
 

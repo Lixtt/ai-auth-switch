@@ -5,6 +5,7 @@ import os
 import selectors
 import shutil
 import sys
+import time
 from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -12,7 +13,7 @@ from typing import Any, TextIO
 
 from ai_auth_switch.app_server_router import AppServerRouteTable
 from ai_auth_switch.errors import AiAuthSwitchError
-from ai_auth_switch.pool import PoolCoordinator, PoolReservation
+from ai_auth_switch.pool import PoolCoordinator, PoolReservation, _health_eligible
 from ai_auth_switch.pool_backend import BackendProcess
 from ai_auth_switch.providers import Provider
 from ai_auth_switch.store import AuthStore, ProfileInfo
@@ -103,14 +104,30 @@ class PoolAppServer:
         self, *, route_key: str | None = None, allow_migrate: bool = False
     ) -> tuple[str, PoolReservation]:
         profiles, usages = self._profiles_and_usage()
-        reservation = self.coordinator.reserve(
-            profiles,
-            usages,
-            route_key=route_key,
-            allow_migrate=allow_migrate,
-            owner=f"pid:{os.getpid()}",
-        )
-        self._ensure_backend(reservation.profile)
+        if route_key and not allow_migrate:
+            reservation = self.coordinator.reserve(
+                profiles,
+                usages,
+                route_key=route_key,
+                allow_migrate=allow_migrate,
+                recover_sticky=True,
+                owner=f"pid:{os.getpid()}",
+            )
+        else:
+            reservation = self.coordinator.reserve(
+                profiles,
+                usages,
+                route_key=route_key,
+                allow_migrate=allow_migrate,
+                owner=f"pid:{os.getpid()}",
+            )
+        try:
+            self._ensure_backend(reservation.profile)
+        except BaseException:
+            # A backend startup failure must not leave a persistent lease that
+            # suppresses capacity for future app-server requests.
+            self.coordinator.release(reservation)
+            raise
         return reservation.profile, reservation
 
     def _ensure_backend(self, profile: str) -> BackendProcess:
@@ -129,6 +146,10 @@ class PoolAppServer:
         if self._selector is not None and backend.stdout is not None:
             self._selector.register(backend.stdout, selectors.EVENT_READ, profile)
         return backend
+
+    def _backend_is_healthy(self, profile: str) -> bool:
+        health = self.coordinator.load().health.get(profile)
+        return health is None or _health_eligible(health, time.time())
 
     def _pending_key(self, profile: str, request_id: object) -> tuple[str, str]:
         return profile, f"{type(request_id).__name__}:{request_id!s}"
@@ -154,8 +175,15 @@ class PoolAppServer:
         backend.send(message)
 
     def _handle_initialize(self, message: dict[str, Any]) -> None:
-        if self.routes.control_backend is None:
-            profile, reservation = self._select_backend(route_key="__control__")
+        control = self.routes.control_backend
+        if control is None or not self._backend_is_healthy(control):
+            previous_reservation = self.reservations.pop("__control__", None)
+            if previous_reservation is not None:
+                self.coordinator.release(previous_reservation)
+            profile, reservation = self._select_backend(
+                route_key="__control__",
+                allow_migrate=control is not None,
+            )
             self.routes.control_backend = profile
             self.reservations["__control__"] = reservation
         backend = self._ensure_backend(self.routes.control_backend)
@@ -207,10 +235,16 @@ class PoolAppServer:
         else:
             route_key = plan.route_key
             backend = self.backends.get(profile)
-            if route_key and (backend is None or not backend.running):
-                self.coordinator.mark_failure(
-                    profile, "process", "backend unavailable for sticky route"
-                )
+            backend_healthy = (
+                backend is not None
+                and backend.running
+                and self._backend_is_healthy(profile)
+            )
+            if route_key and not backend_healthy:
+                if backend is None or not backend.running:
+                    self.coordinator.mark_failure(
+                        profile, "process", "backend unavailable for sticky route"
+                    )
                 profile, reservation = self._select_backend(
                     route_key=route_key, allow_migrate=True
                 )
@@ -222,7 +256,12 @@ class PoolAppServer:
     def _handle_global(self, message: dict[str, Any]) -> None:
         profile = self.routes.control_backend
         backend = self.backends.get(profile) if profile else None
-        if profile is None or backend is None or not backend.running:
+        if (
+            profile is None
+            or backend is None
+            or not backend.running
+            or not self._backend_is_healthy(profile)
+        ):
             previous_reservation = self.reservations.pop("__control__", None)
             if previous_reservation is not None:
                 self.coordinator.release(previous_reservation)

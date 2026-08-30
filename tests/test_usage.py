@@ -7,6 +7,7 @@ import json
 import tempfile
 import time
 import unittest
+import urllib.error
 from datetime import timezone
 from pathlib import Path
 from unittest import mock
@@ -192,6 +193,77 @@ class UsageTests(unittest.TestCase):
             # than stranding a healthy account with a transient error.
             self.assertEqual(second["one"].plan_type, "good")
             self.assertIsNone(second["one"].error)
+
+    def test_authentication_expiry_replaces_last_good_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auth = root / "auth.json"
+            auth.write_text('{"version": 1}')
+            calls = []
+
+            def fetcher(path, *, timeout):
+                calls.append(path.read_text())
+                if len(calls) == 1:
+                    return AccountUsage(plan_type="free")
+                return AccountUsage(error="authentication expired")
+
+            kwargs = {
+                "cache_dir": root / "cache",
+                "fetcher": fetcher,
+                "refresh": True,
+            }
+            first = fetch_profile_usage([("one", auth)], **kwargs)
+            self.assertEqual(first["one"].plan_type, "free")
+
+            expired = fetch_profile_usage([("one", auth)], **kwargs)
+            self.assertEqual(expired["one"].error, "authentication expired")
+            self.assertIsNone(expired["one"].plan_type)
+            self.assertEqual(
+                format_usage(expired["one"]),
+                "usage unavailable: authentication expired",
+            )
+
+            # The definitive error is cached, so a normal (non-refresh) list
+            # cannot immediately resurrect the stale free-plan snapshot.
+            cached = fetch_profile_usage(
+                [("one", auth)],
+                cache_dir=root / "cache",
+                fetcher=fetcher,
+            )
+            self.assertEqual(cached["one"].error, "authentication expired")
+            self.assertIsNone(cached["one"].plan_type)
+            self.assertEqual(len(calls), 2)
+
+    def test_raised_http_auth_error_replaces_last_good_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auth = root / "auth.json"
+            auth.write_text('{"version": 1}')
+
+            fetch_profile_usage(
+                [("one", auth)],
+                cache_dir=root / "cache",
+                refresh=True,
+                fetcher=lambda _path, **_kwargs: AccountUsage(plan_type="pro"),
+            )
+
+            def fetcher(_path, **_kwargs):
+                raise urllib.error.HTTPError(
+                    "https://chatgpt.com/backend-api/wham/usage",
+                    401,
+                    "expired",
+                    {},
+                    None,
+                )
+
+            expired = fetch_profile_usage(
+                [("one", auth)],
+                cache_dir=root / "cache",
+                refresh=True,
+                fetcher=fetcher,
+            )
+            self.assertEqual(expired["one"].error, "authentication expired")
+            self.assertIsNone(expired["one"].plan_type)
 
     def test_profile_sort_puts_free_after_paid(self) -> None:
         from ai_auth_switch.cli import _profile_sort_key

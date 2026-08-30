@@ -152,6 +152,54 @@ class PoolServerTests(unittest.TestCase):
             )
             self.assertEqual(backend.messages[-1]["method"], "turn/start")
 
+    def test_initialization_recovers_stale_control_route(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            for name in ("a", "b"):
+                store.write_profile_content(
+                    provider,
+                    name,
+                    json.dumps({"tokens": {"access_token": f"token-{name}"}}),
+                )
+            profiles = store.list_profiles(provider)
+            usages = {"a": usage(90), "b": usage(80)}
+            seed = PoolAppServer(
+                store,
+                provider,
+                backend_factory=FakeBackend,
+                usage_fetcher=lambda _profiles, **_kwargs: usages,
+            )
+            initial = seed.coordinator.reserve(
+                profiles,
+                usages,
+                route_key="__control__",
+                owner=f"pid:{os.getpid()}",
+                now=10,
+            )
+            self.assertEqual(initial.profile, "a")
+            seed.coordinator.release(initial)
+            seed.coordinator.mark_failure("a", "401", "expired", now=11)
+
+            output = io.StringIO()
+            server = PoolAppServer(
+                store,
+                provider,
+                output_stream=output,
+                backend_factory=FakeBackend,
+                usage_fetcher=lambda _profiles, **_kwargs: usages,
+            )
+            server._handle_client_message(
+                {"method": "initialize", "id": 1, "params": {}}
+            )
+
+            response = json.loads(output.getvalue().splitlines()[0])
+            self.assertEqual(response["id"], 1)
+            self.assertEqual(server.routes.control_backend, "b")
+            self.assertIn("b", server.backends)
+
     def test_backend_server_requests_are_forwarded_and_responses_restored(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -261,6 +309,49 @@ class PoolServerTests(unittest.TestCase):
             server._handle_client_message(
                 {"method": "turn/start", "id": 3, "params": {"threadId": "thr-1"}}
             )
+            migrated = "b" if first.profile == "a" else "a"
+            self.assertEqual(server.routes.backend_for_thread("thr-1"), migrated)
+            self.assertEqual(
+                server.backends[migrated].messages[-1]["method"], "turn/start"
+            )
+
+    def test_unhealthy_running_thread_backend_migrates_before_forwarding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            for name in ("a", "b"):
+                store.write_profile_content(
+                    provider,
+                    name,
+                    json.dumps({"tokens": {"access_token": f"token-{name}"}}),
+                )
+            usages = {"a": usage(90), "b": usage(80)}
+            server = PoolAppServer(
+                store,
+                provider,
+                backend_factory=FakeBackend,
+                output_stream=io.StringIO(),
+                usage_fetcher=lambda _profiles, **_kwargs: usages,
+            )
+            server._handle_client_message({"method": "initialize", "id": 1})
+            server._handle_client_message({"method": "thread/start", "id": 2})
+            first = next(
+                backend
+                for backend in server.backends.values()
+                if backend.messages and backend.messages[-1]["method"] == "thread/start"
+            )
+            server._handle_backend_message(
+                first.profile,
+                {"id": 2, "result": {"thread": {"id": "thr-1"}}},
+            )
+            server.coordinator.mark_failure(first.profile, "401", "expired")
+
+            server._handle_client_message(
+                {"method": "turn/start", "id": 3, "params": {"threadId": "thr-1"}}
+            )
+
             migrated = "b" if first.profile == "a" else "a"
             self.assertEqual(server.routes.backend_for_thread("thr-1"), migrated)
             self.assertEqual(

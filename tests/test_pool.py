@@ -87,6 +87,43 @@ class PoolTests(unittest.TestCase):
             self.assertEqual(migrated.profile, "b")
             coordinator.release(migrated)
 
+    def test_sticky_recovery_keeps_route_selected_by_another_worker(self) -> None:
+        tmp, _store, _provider, profiles, coordinator = self._setup()
+        with tmp:
+            first = coordinator.reserve(
+                profiles,
+                {"a": usage(90), "b": usage(80)},
+                route_key="thread-1",
+                owner="pid:100",
+                now=10,
+            )
+            coordinator.release(first)
+            coordinator.mark_failure("a", "401", "expired", now=11)
+
+            # Another worker has already migrated the route to b. Recovery
+            # must retain that healthy target instead of selecting a again.
+            migrated = coordinator.reserve(
+                profiles,
+                {"a": usage(90), "b": usage(80)},
+                route_key="thread-1",
+                owner="pid:100",
+                now=12,
+                allow_migrate=True,
+            )
+            coordinator.release(migrated)
+            coordinator.mark_success("a", now=12.5)
+            recovered = coordinator.reserve(
+                profiles,
+                {"a": usage(90), "b": usage(80)},
+                route_key="thread-1",
+                owner="pid:100",
+                now=13,
+                allow_migrate=True,
+                recover_sticky=True,
+            )
+            self.assertEqual(recovered.profile, "b")
+            coordinator.release(recovered)
+
     def test_sticky_route_refuses_unhealthy_backend_without_migration(self) -> None:
         tmp, _store, _provider, profiles, coordinator = self._setup()
         with tmp:
@@ -172,6 +209,69 @@ class PoolTests(unittest.TestCase):
             self.assertEqual(health.status, "healthy")
             self.assertEqual(health.failure_count, 0)
             self.assertIsNone(health.last_error)
+
+    def test_auth_failure_can_recover_after_profile_credentials_change(self) -> None:
+        tmp, store, provider, _profiles, coordinator = self._setup()
+        with tmp:
+            # Use real profile files so the coordinator can detect the
+            # credential replacement rather than relying on synthetic paths.
+            profiles = []
+            for name in ("a", "b"):
+                path = store.write_profile_content(
+                    provider,
+                    name,
+                    json.dumps({"tokens": {"access_token": f"old-{name}"}}),
+                ).path
+                profiles.append(ProfileInfo(name, path))
+            coordinator.mark_failure("a", "401", "expired", now=10)
+            store.profile_path(provider, "a").write_text(
+                json.dumps({"tokens": {"access_token": "new-a"}}),
+                encoding="utf-8",
+            )
+
+            reservation = coordinator.reserve(
+                profiles,
+                {"a": usage(90), "b": usage(20)},
+                owner="pid:100",
+                now=11,
+            )
+            self.assertEqual(reservation.profile, "a")
+            coordinator.release(reservation)
+
+    def test_legacy_auth_failure_state_is_not_reenabled_without_change(self) -> None:
+        tmp, store, provider, _profiles, coordinator = self._setup()
+        with tmp:
+            profiles = []
+            for name in ("a", "b"):
+                path = store.write_profile_content(
+                    provider,
+                    name,
+                    json.dumps({"tokens": {"access_token": f"token-{name}"}}),
+                ).path
+                profiles.append(ProfileInfo(name, path))
+            # Write a legacy-shaped JSON object directly to model
+            # pre-fingerprint state.
+            pool_path = pool_state_path(store, provider)
+            pool_path.parent.mkdir(parents=True, exist_ok=True)
+            pool_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "health": {"a": {"status": "auth_expired"}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            reservation = coordinator.reserve(
+                profiles,
+                {"a": usage(90), "b": usage(20)},
+                owner="pid:100",
+                now=11,
+            )
+            self.assertEqual(reservation.profile, "b")
+            coordinator.release(reservation)
+            self.assertIsNotNone(coordinator.load().health["a"].auth_fingerprint)
 
 
 if __name__ == "__main__":
