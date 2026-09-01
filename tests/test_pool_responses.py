@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import http.client
 import io
 import json
 import os
+import socket
 import tempfile
 import unittest
 import urllib.error
@@ -15,6 +17,7 @@ from ai_auth_switch.errors import AiAuthSwitchError
 from ai_auth_switch.pool_responses import (
     PoolResponsesProxy,
     ResponsesProxyConfig,
+    _http_server_for_host,
     _models_upstream_url,
     ensure_listener_token,
     request_route_key,
@@ -224,6 +227,31 @@ class PoolResponsesTests(unittest.TestCase):
                     config=ResponsesProxyConfig(host="0.0.0.0"),
                 )
 
+    def test_ipv6_loopback_listener_uses_ipv6_address_family(self) -> None:
+        if not socket.has_ipv6:
+            self.skipTest("IPv6 is unavailable on this host")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            store.write_profile_content(
+                provider,
+                "a",
+                json.dumps({"tokens": {"access_token": "token-a"}}),
+            )
+            proxy = PoolResponsesProxy(
+                store,
+                provider,
+                config=ResponsesProxyConfig(host="::1", port=0),
+                usage_fetcher=lambda _profiles, **_kwargs: {"a": usage(80)},
+            )
+            server = _http_server_for_host("::1", 0, proxy._handler_class())
+            try:
+                self.assertEqual(server.address_family, socket.AF_INET6)
+            finally:
+                server.server_close()
+
     def test_retry_moves_to_another_account_before_response_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -353,6 +381,137 @@ class PoolResponsesTests(unittest.TestCase):
                 [item.get_header("Authorization") for item in requests],
                 ["Bearer token-a", "Bearer token-b"],
             )
+
+    def test_retry_recovers_from_incomplete_upstream_stream(self) -> None:
+        """A truncated upstream body must not crash the proxy worker."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            for name in ("a", "b"):
+                store.write_profile_content(
+                    provider,
+                    name,
+                    json.dumps({"tokens": {"access_token": f"token-{name}"}}),
+                )
+            requests: list[urllib.request.Request] = []
+            attempts = 0
+
+            class TruncatedResponse(FakeResponse):
+                def read(self, _size: int = -1) -> bytes:
+                    raise http.client.IncompleteRead(b"partial", 3)
+
+            def opener(request, **_kwargs):
+                nonlocal attempts
+                attempts += 1
+                requests.append(request)
+                if attempts == 1:
+                    response = TruncatedResponse(b"ignored")
+                    # A retryable status is buffered before headers are sent
+                    # to the caller, so a truncated body can safely fail over.
+                    response.status = 503
+                    return response
+                return FakeResponse(b"complete")
+
+            proxy = PoolResponsesProxy(
+                store,
+                provider,
+                config=ResponsesProxyConfig(max_retries=1),
+                opener=opener,
+                usage_fetcher=lambda _profiles, **_kwargs: {
+                    "a": usage(80),
+                    "b": usage(70),
+                },
+            )
+            result = proxy.forward(b"{}", {})
+
+            self.assertEqual(result.status, 200)
+            self.assertEqual(result.body, b"complete")
+            self.assertEqual(len(requests), 2)
+
+    def test_incomplete_body_after_headers_is_returned_without_traceback(self) -> None:
+        """Once headers are sent, a truncated stream is safely terminated."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            store.write_profile_content(
+                provider,
+                "a",
+                json.dumps({"tokens": {"access_token": "token-a"}}),
+            )
+
+            class TruncatedResponse(FakeResponse):
+                def read(self, _size: int = -1) -> bytes:
+                    if not self.sent:
+                        self.sent = True
+                        return b"partial"
+                    raise http.client.IncompleteRead(b"partial", 2)
+
+            proxy = PoolResponsesProxy(
+                store,
+                provider,
+                config=ResponsesProxyConfig(max_retries=1),
+                opener=lambda _request, **_kwargs: TruncatedResponse(b"ignored"),
+                usage_fetcher=lambda _profiles, **_kwargs: {"a": usage(80)},
+            )
+            chunks: list[bytes] = []
+            headers: list[tuple[int, dict[str, str]]] = []
+
+            proxy.stream(
+                b"{}",
+                {},
+                on_headers=lambda status, values: headers.append((status, values)),
+                on_chunk=chunks.append,
+            )
+
+            self.assertEqual(headers[0][0], 200)
+            self.assertEqual(b"".join(chunks), b"partial")
+
+    def test_forward_models_retries_incomplete_catalog_body(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            for name in ("a", "b"):
+                store.write_profile_content(
+                    provider,
+                    name,
+                    json.dumps({"tokens": {"access_token": f"token-{name}"}}),
+                )
+            attempts = 0
+
+            class TruncatedResponse(FakeResponse):
+                def read(self, _size: int = -1) -> bytes:
+                    raise http.client.IncompleteRead(b"partial", 3)
+
+            def opener(_request, **_kwargs):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    return TruncatedResponse(b"ignored")
+                response = FakeResponse(b'{"data":[]}')
+                response.headers = {"Content-Type": "application/json"}
+                return response
+
+            proxy = PoolResponsesProxy(
+                store,
+                provider,
+                config=ResponsesProxyConfig(max_retries=1),
+                opener=opener,
+                usage_fetcher=lambda _profiles, **_kwargs: {
+                    "a": usage(80),
+                    "b": usage(70),
+                },
+            )
+            result = proxy.forward_models({})
+
+            self.assertEqual(result.status, 200)
+            self.assertEqual(result.body, b'{"data":[]}')
+            self.assertEqual(attempts, 2)
 
     def test_unhealthy_sticky_route_migrates_before_upstream_request(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import os
 import secrets
@@ -46,6 +47,32 @@ HOP_BY_HOP_HEADERS = frozenset(
         "upgrade",
     }
 )
+
+
+class _IPv6ThreadingHTTPServer(ThreadingHTTPServer):
+    """Threading HTTP server variant that can bind an IPv6 loopback host."""
+
+    address_family = socket.AF_INET6
+
+
+def _http_server_for_host(
+    host: str,
+    port: int,
+    handler: type[BaseHTTPRequestHandler],
+) -> ThreadingHTTPServer:
+    """Construct a listener with an address family matching *host*.
+
+    ``ThreadingHTTPServer`` defaults to AF_INET even when the configured host
+    is ``::1``.  The proxy explicitly permits IPv6 loopback, so select the
+    IPv6 subclass for literal IPv6 addresses before binding.
+    """
+
+    try:
+        is_ipv6 = ip_address(host).version == 6
+    except ValueError:
+        is_ipv6 = False
+    server_type = _IPv6ThreadingHTTPServer if is_ipv6 else ThreadingHTTPServer
+    return server_type((host, port), handler)
 
 
 @dataclass(frozen=True)
@@ -508,7 +535,12 @@ class PoolResponsesProxy:
                 else:
                     self.coordinator.mark_success(reservation.profile)
                 return ProxyResponse(status, response_headers, body)
-            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                OSError,
+                http.client.HTTPException,
+            ) as exc:
                 # A transport error while reading a model catalog is
                 # recoverable before any response is sent to the caller.
                 reason = str(getattr(exc, "reason", exc))
@@ -629,7 +661,12 @@ class PoolResponsesProxy:
                     on_headers(status, response_headers)
                     on_chunk(error_body)
                     return
-                except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                except (
+                    urllib.error.URLError,
+                    TimeoutError,
+                    OSError,
+                    http.client.HTTPException,
+                ) as exc:
                     last_error = str(getattr(exc, "reason", exc))
                     self.coordinator.mark_failure(
                         reservation.profile,
@@ -665,7 +702,12 @@ class PoolResponsesProxy:
                     on_chunk(chunk)
                 self.coordinator.mark_success(reservation.profile)
                 return
-            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                OSError,
+                http.client.HTTPException,
+            ) as exc:
                 last_error = str(getattr(exc, "reason", exc))
                 self.coordinator.mark_failure(
                     reservation.profile,
@@ -794,8 +836,10 @@ class PoolResponsesProxy:
         return Handler
 
     def serve_forever(self) -> None:
-        self._httpd = ThreadingHTTPServer(
-            (self.config.host, self.config.port), self._handler_class()
+        self._httpd = _http_server_for_host(
+            self.config.host,
+            self.config.port,
+            self._handler_class(),
         )
         self._httpd.daemon_threads = True
         try:
