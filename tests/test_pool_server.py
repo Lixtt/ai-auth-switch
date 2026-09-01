@@ -200,6 +200,92 @@ class PoolServerTests(unittest.TestCase):
             self.assertEqual(server.routes.control_backend, "b")
             self.assertIn("b", server.backends)
 
+    def test_global_request_migrates_unhealthy_control_backend(self) -> None:
+        """Account/config/model requests must not stay pinned to an expired control account."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            for name in ("a", "b"):
+                store.write_profile_content(
+                    provider,
+                    name,
+                    json.dumps({"tokens": {"access_token": f"token-{name}"}}),
+                )
+            usages = {"a": usage(90), "b": usage(80)}
+            output = io.StringIO()
+            server = PoolAppServer(
+                store,
+                provider,
+                backend_factory=FakeBackend,
+                output_stream=output,
+                usage_fetcher=lambda _profiles, **_kwargs: usages,
+            )
+            server._handle_client_message({"method": "initialize", "id": 1})
+            self.assertEqual(server.routes.control_backend, "a")
+            server.coordinator.mark_failure("a", "401", "expired")
+
+            server._handle_client_message({"method": "account/read", "id": 2})
+
+            self.assertEqual(server.routes.control_backend, "b")
+            self.assertEqual(server.backends["b"].messages[-1]["method"], "account/read")
+            self.assertEqual(server.backends["a"].messages, [])
+
+    def test_client_id_with_pool_prefix_is_not_mistaken_for_server_response(self) -> None:
+        """JSON-RPC permits arbitrary string IDs, including the pool prefix."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            store.write_profile_content(
+                provider,
+                "a",
+                json.dumps({"tokens": {"access_token": "token-a"}}),
+            )
+            server = PoolAppServer(
+                store,
+                provider,
+                backend_factory=FakeBackend,
+                output_stream=io.StringIO(),
+                usage_fetcher=lambda _profiles, **_kwargs: {"a": usage(80)},
+            )
+            server._handle_client_message({"method": "initialize", "id": 1})
+
+            server._handle_client_message(
+                {"method": "config/read", "id": "pool:client-request", "params": {}}
+            )
+
+            backend = server.backends["a"]
+            self.assertEqual(backend.messages[-1]["id"], "pool:client-request")
+
+    def test_replacing_dead_backend_retires_old_instance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            store.write_profile_content(
+                provider,
+                "a",
+                json.dumps({"tokens": {"access_token": "token-a"}}),
+            )
+            server = PoolAppServer(
+                store,
+                provider,
+                backend_factory=FakeBackend,
+                output_stream=io.StringIO(),
+                usage_fetcher=lambda _profiles, **_kwargs: {"a": usage(80)},
+            )
+            first = server._ensure_backend("a")
+            first.running = False
+            second = server._ensure_backend("a")
+
+            self.assertIsNot(first, second)
+            self.assertTrue(second.running)
+            self.assertEqual(server.backends["a"], second)
+
     def test_backend_server_requests_are_forwarded_and_responses_restored(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
