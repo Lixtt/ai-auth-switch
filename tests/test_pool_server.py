@@ -12,6 +12,7 @@ from pathlib import Path
 from ai_auth_switch.pool_server import PoolAppServer, PoolServerConfig
 from ai_auth_switch.providers.codex import CodexProvider
 from ai_auth_switch.store import AuthStore
+from ai_auth_switch.errors import AiAuthSwitchError
 from ai_auth_switch.usage import AccountUsage, UsageWindow
 
 
@@ -285,6 +286,97 @@ class PoolServerTests(unittest.TestCase):
             self.assertIsNot(first, second)
             self.assertTrue(second.running)
             self.assertEqual(server.backends["a"], second)
+
+    def test_backend_send_failure_cleans_pending_reservation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            store.write_profile_content(
+                provider,
+                "a",
+                json.dumps({"tokens": {"access_token": "token-a"}}),
+            )
+
+            class FailingBackend(FakeBackend):
+                def send(self, message):
+                    if message.get("method") == "thread/start":
+                        raise AiAuthSwitchError("broken backend pipe")
+                    super().send(message)
+
+            server = PoolAppServer(
+                store,
+                provider,
+                backend_factory=FailingBackend,
+                output_stream=io.StringIO(),
+                usage_fetcher=lambda _profiles, **_kwargs: {"a": usage(80)},
+            )
+            server._handle_client_message({"method": "initialize", "id": 1})
+
+            with self.assertRaisesRegex(AiAuthSwitchError, "broken backend pipe"):
+                server._handle_client_message({"method": "thread/start", "id": 2})
+
+            self.assertNotIn(("a", "int:2"), server.pending)
+            leases = server.coordinator.load().leases
+            self.assertEqual(len(leases), 1)
+            self.assertEqual(leases[0].route_key, "__control__")
+
+    def test_run_returns_scoped_error_after_backend_send_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            store.write_profile_content(
+                provider,
+                "a",
+                json.dumps({"tokens": {"access_token": "token-a"}}),
+            )
+
+            class FailingBackend(FakeBackend):
+                def send(self, message):
+                    if message.get("method") == "config/read":
+                        raise AiAuthSwitchError("broken backend pipe")
+                    super().send(message)
+
+            client_read, client_write = os.pipe()
+            server_read, server_write = os.pipe()
+            client_input = os.fdopen(client_read, "r", encoding="utf-8")
+            client_output = os.fdopen(server_write, "w", encoding="utf-8")
+            server = PoolAppServer(
+                store,
+                provider,
+                input_stream=client_input,
+                output_stream=client_output,
+                backend_factory=FailingBackend,
+                usage_fetcher=lambda _profiles, **_kwargs: {"a": usage(80)},
+            )
+            thread = __import__("threading").Thread(target=server.run, daemon=True)
+            thread.start()
+
+            def request(message: dict) -> dict:
+                os.write(client_write, (json.dumps(message) + "\n").encode())
+                ready, _, _ = select.select([server_read], [], [], 5)
+                self.assertTrue(ready)
+                return json.loads(os.read(server_read, 65536).decode().splitlines()[0])
+
+            try:
+                self.assertEqual(request({"method": "initialize", "id": 1})["id"], 1)
+                error = request({"method": "config/read", "id": 2})
+                self.assertEqual(error["id"], 2)
+                self.assertEqual(error["error"]["code"], -32005)
+                # The pool loop remains alive and can answer a later request
+                # rather than exiting on the first broken backend write.
+                error = request({"method": "config/read", "id": 3})
+                self.assertEqual(error["id"], 3)
+                self.assertEqual(error["error"]["code"], -32005)
+            finally:
+                os.close(client_write)
+                thread.join(timeout=5)
+                client_input.close()
+                client_output.close()
+                os.close(server_read)
 
     def test_backend_server_requests_are_forwarded_and_responses_restored(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

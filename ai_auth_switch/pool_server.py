@@ -171,15 +171,33 @@ class PoolAppServer:
     ) -> None:
         backend = self._ensure_backend(profile)
         request_id = message.get("id")
+        pending_key: tuple[str, str] | None = None
         if request_id is not None and track_response:
-            self.pending[self._pending_key(profile, request_id)] = (
-                _PendingClientRequest(
-                    client_id=request_id,
-                    method=str(message.get("method", "")),
-                    reservation=reservation,
-                )
+            pending_key = self._pending_key(profile, request_id)
+            self.pending[pending_key] = _PendingClientRequest(
+                client_id=request_id,
+                method=str(message.get("method", "")),
+                reservation=reservation,
             )
-        backend.send(message)
+        try:
+            backend.send(message)
+        except BaseException as exc:
+            # Do not leave an invisible lease or pending request behind when
+            # a backend exits between selection and the write.  The caller can
+            # return a scoped error while the next request reselects a worker.
+            # Retiring the process also removes any other requests pinned to
+            # it and prevents a broken-but-still-running object from being
+            # reused on the next request.
+            with suppress(Exception):
+                self._retire_backend(profile, f"send failed: {exc}")
+            if pending_key is not None:
+                # _retire_backend normally consumed this entry; the fallback
+                # handles custom backend implementations that disappeared
+                # before they could be registered in ``self.backends``.
+                pending = self.pending.pop(pending_key, None)
+                if pending is not None and pending.reservation is not None:
+                    self.coordinator.release(pending.reservation)
+            raise
 
     def _handle_initialize(self, message: dict[str, Any]) -> None:
         control = self.routes.control_backend
@@ -467,7 +485,24 @@ class PoolAppServer:
                             raise AiAuthSwitchError(
                                 "client sent a non-object JSON message"
                             )
-                        self._handle_client_message(message)
+                        try:
+                            self._handle_client_message(message)
+                        except Exception as exc:
+                            # A single backend write/selection failure must
+                            # not terminate the shared pool process.  Return a
+                            # JSON-RPC error for this request and let later
+                            # requests select a healthy account.
+                            request_id = message.get("id")
+                            if request_id is not None:
+                                self._write(
+                                    {
+                                        "id": request_id,
+                                        "error": {
+                                            "code": -32005,
+                                            "message": str(exc),
+                                        },
+                                    }
+                                )
                     else:
                         profile = key.data
                         backend = self.backends.get(profile)
