@@ -319,8 +319,7 @@ class PoolServerTests(unittest.TestCase):
 
             self.assertNotIn(("a", "int:2"), server.pending)
             leases = server.coordinator.load().leases
-            self.assertEqual(len(leases), 1)
-            self.assertEqual(leases[0].route_key, "__control__")
+            self.assertEqual(leases, [])
             # _send_to_backend must leave reporting of the failed request to
             # the run loop; otherwise the client would receive two responses
             # for id=2.

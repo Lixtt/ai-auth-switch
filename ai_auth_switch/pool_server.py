@@ -423,6 +423,16 @@ class PoolAppServer:
         backend = self.backends.pop(profile, None)
         if backend is None:
             return
+        control_reservation = None
+        if self.routes.control_backend == profile:
+            # The control lease is held for the lifetime of its backend.  Once
+            # that process is retired it must be released immediately, or a
+            # dead control account can consume capacity until stale-lease
+            # pruning (normally 24 hours later).
+            control_reservation = self.reservations.pop("__control__", None)
+        if control_reservation is not None:
+            with suppress(Exception):
+                self.coordinator.release(control_reservation)
         if mark_failure:
             self.coordinator.mark_failure(profile, "process", message)
         self._fail_backend(profile, f"pool backend {profile} failed: {message}")
