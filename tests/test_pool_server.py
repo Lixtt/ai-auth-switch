@@ -9,10 +9,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from ai_auth_switch.errors import AiAuthSwitchError
 from ai_auth_switch.pool_server import PoolAppServer, PoolServerConfig
 from ai_auth_switch.providers.codex import CodexProvider
 from ai_auth_switch.store import AuthStore
-from ai_auth_switch.errors import AiAuthSwitchError
 from ai_auth_switch.usage import AccountUsage, UsageWindow
 
 
@@ -321,6 +321,14 @@ class PoolServerTests(unittest.TestCase):
             leases = server.coordinator.load().leases
             self.assertEqual(len(leases), 1)
             self.assertEqual(leases[0].route_key, "__control__")
+            # _send_to_backend must leave reporting of the failed request to
+            # the run loop; otherwise the client would receive two responses
+            # for id=2.
+            responses = [
+                json.loads(line)
+                for line in server.output_stream.getvalue().splitlines()
+            ]
+            self.assertEqual([item["id"] for item in responses], [1])
 
     def test_run_returns_scoped_error_after_backend_send_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -188,15 +188,21 @@ class PoolAppServer:
             # Retiring the process also removes any other requests pinned to
             # it and prevents a broken-but-still-running object from being
             # reused on the next request.
+            # Remove the failed request *before* retirement.  _retire_backend
+            # emits errors for all remaining pending requests; leaving this
+            # one in the map would make the run loop emit a duplicate response
+            # when it reports the send exception to the client.
+            pending = (
+                self.pending.pop(pending_key, None)
+                if pending_key is not None
+                else None
+            )
+            if pending is not None and pending.reservation is not None:
+                self.coordinator.release(pending.reservation)
+            elif reservation is not None:
+                self.coordinator.release(reservation)
             with suppress(Exception):
                 self._retire_backend(profile, f"send failed: {exc}")
-            if pending_key is not None:
-                # _retire_backend normally consumed this entry; the fallback
-                # handles custom backend implementations that disappeared
-                # before they could be registered in ``self.backends``.
-                pending = self.pending.pop(pending_key, None)
-                if pending is not None and pending.reservation is not None:
-                    self.coordinator.release(pending.reservation)
             raise
 
     def _handle_initialize(self, message: dict[str, Any]) -> None:
