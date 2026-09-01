@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import tempfile
@@ -14,6 +15,7 @@ from ai_auth_switch.errors import AiAuthSwitchError
 from ai_auth_switch.pool_responses import (
     PoolResponsesProxy,
     ResponsesProxyConfig,
+    _models_upstream_url,
     ensure_listener_token,
     request_route_key,
 )
@@ -57,6 +59,22 @@ def usage(remaining: float) -> AccountUsage:
 
 
 class PoolResponsesTests(unittest.TestCase):
+    def test_models_upstream_url_replaces_responses_and_merges_query(self) -> None:
+        self.assertEqual(
+            _models_upstream_url(
+                "https://example.test/backend-api/codex/responses?tenant=one",
+                "/v1/models?client_version=0.152.0",
+            ),
+            "https://example.test/backend-api/codex/models?tenant=one&client_version=0.152.0",
+        )
+        self.assertEqual(
+            _models_upstream_url(
+                "http://127.0.0.1:9000/v1/responses/",
+                "/models",
+            ),
+            "http://127.0.0.1:9000/v1/models",
+        )
+
     def test_request_route_key_prefers_stable_thread_metadata(self) -> None:
         body = json.dumps(
             {
@@ -848,6 +866,172 @@ class PoolResponsesTests(unittest.TestCase):
             finally:
                 upstream.shutdown()
                 upstream.server_close()
+
+    def test_forward_models_uses_sibling_endpoint_and_profile_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            store.write_profile_content(
+                provider,
+                "a",
+                json.dumps(
+                    {
+                        "tokens": {
+                            "access_token": "token-a",
+                            "account_id": "account-a",
+                        }
+                    }
+                ),
+            )
+            requests: list[urllib.request.Request] = []
+
+            def opener(request, **_kwargs):
+                requests.append(request)
+                response = FakeResponse(b'{"models":[]}')
+                response.headers = {
+                    "Content-Type": "application/json",
+                    "ETag": 'W/"catalog-a"',
+                    "Content-Length": "13",
+                    "Connection": "keep-alive",
+                    "X-Catalog": "ok",
+                }
+                return response
+
+            proxy = PoolResponsesProxy(
+                store,
+                provider,
+                config=ResponsesProxyConfig(
+                    upstream_url="https://example.test/backend-api/codex/responses?tenant=one",
+                    max_retries=0,
+                ),
+                opener=opener,
+                usage_fetcher=lambda _profiles, **_kwargs: {"a": usage(80)},
+            )
+            result = proxy.forward_models(
+                {
+                    "Authorization": "Bearer local-token",
+                    "X-AI-Auth-Switch-Token": proxy.listener_token,
+                    "ChatGPT-Account-Id": "wrong-account",
+                    "X-Test": "keep",
+                },
+                request_target="/v1/models?client_version=0.152.0",
+            )
+
+            self.assertEqual(result.status, 200)
+            self.assertEqual(result.body, b'{"models":[]}')
+            self.assertEqual(result.headers["ETag"], 'W/"catalog-a"')
+            self.assertNotIn("Content-Length", result.headers)
+            self.assertNotIn("Connection", result.headers)
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(
+                requests[0].full_url,
+                "https://example.test/backend-api/codex/models?tenant=one&client_version=0.152.0",
+            )
+            self.assertEqual(requests[0].get_method(), "GET")
+            self.assertEqual(requests[0].get_header("Authorization"), "Bearer token-a")
+            self.assertEqual(
+                requests[0].get_header("Chatgpt-account-id"), "account-a"
+            )
+            self.assertEqual(requests[0].get_header("X-test"), "keep")
+            self.assertEqual(requests[0].get_header("Content-type"), None)
+
+    def test_forward_models_retries_auth_failure_on_another_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            for name in ("a", "b"):
+                store.write_profile_content(
+                    provider,
+                    name,
+                    json.dumps({"tokens": {"access_token": f"token-{name}"}}),
+                )
+            requests: list[urllib.request.Request] = []
+            attempts = 0
+
+            def opener(request, **_kwargs):
+                nonlocal attempts
+                attempts += 1
+                requests.append(request)
+                if attempts == 1:
+                    raise urllib.error.HTTPError(
+                        request.full_url,
+                        401,
+                        "expired",
+                        {"Content-Type": "application/json"},
+                        io.BytesIO(b'{"error":"expired"}'),
+                    )
+                return FakeResponse(b'{"models":[]}')
+
+            proxy = PoolResponsesProxy(
+                store,
+                provider,
+                config=ResponsesProxyConfig(max_retries=1),
+                opener=opener,
+                usage_fetcher=lambda _profiles, **_kwargs: {
+                    "a": usage(80),
+                    "b": usage(70),
+                },
+            )
+            result = proxy.forward_models({}, request_target="/v1/models")
+
+            self.assertEqual(result.status, 200)
+            self.assertEqual(
+                [request.get_header("Authorization") for request in requests],
+                ["Bearer token-a", "Bearer token-b"],
+            )
+
+    def test_http_handler_serves_models_alias_and_requires_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            store.write_profile_content(
+                provider,
+                "a",
+                json.dumps({"tokens": {"access_token": "token-a"}}),
+            )
+            seen: list[urllib.request.Request] = []
+
+            def opener(request, **_kwargs):
+                seen.append(request)
+                return FakeResponse(b'{"models":[]}')
+
+            proxy = PoolResponsesProxy(
+                store,
+                provider,
+                config=ResponsesProxyConfig(
+                    upstream_url="http://example.test/backend-api/codex/responses",
+                    max_retries=0,
+                ),
+                opener=opener,
+                usage_fetcher=lambda _profiles, **_kwargs: {"a": usage(80)},
+            )
+            local = ThreadingHTTPServer(("127.0.0.1", 0), proxy._handler_class())
+            thread = Thread(target=local.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base = f"http://127.0.0.1:{local.server_address[1]}"
+                unauthorized = urllib.request.Request(f"{base}/v1/models")
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    urllib.request.urlopen(unauthorized, timeout=5)
+                self.assertEqual(error.exception.code, 401)
+
+                request = urllib.request.Request(
+                    f"{base}/models?client_version=0.152.0",
+                    headers={"Authorization": f"Bearer {proxy.listener_token}"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.read(), b'{"models":[]}')
+                self.assertEqual(seen[0].full_url, "http://example.test/backend-api/codex/models?client_version=0.152.0")
+            finally:
+                local.shutdown()
+                local.server_close()
 
 
 if __name__ == "__main__":

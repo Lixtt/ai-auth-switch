@@ -6,6 +6,7 @@ import os
 import secrets
 import socket
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -32,6 +33,19 @@ MAX_REQUEST_BYTES = 32 * 1024 * 1024
 RETRYABLE_STATUS_CODES = {401, 403, 408, 409, 429, 500, 502, 503, 504}
 LOCAL_AUTH_HEADER = "X-AI-Auth-Switch-Token"
 LOCAL_ROUTE_HEADER = "X-AI-Auth-Switch-Route"
+HOP_BY_HOP_HEADERS = frozenset(
+    {
+        "connection",
+        "content-length",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -114,11 +128,64 @@ def _profile_auth(path: Path) -> tuple[str | None, str | None]:
     return clean_token, clean_account
 
 
+def _models_upstream_url(upstream_url: str, request_target: str) -> str:
+    """Build the sibling ``/models`` URL for a Responses request.
+
+    The Codex backend exposes ``/responses`` and ``/models`` beside each
+    other.  Keeping the configured scheme/host/prefix (and merging both sets
+    of query parameters) lets the pool work with the default ChatGPT endpoint
+    as well as custom compatible gateways.
+    """
+
+    upstream = urllib.parse.urlsplit(upstream_url)
+    upstream_path = upstream.path.rstrip("/")
+    path_parts = upstream_path.rsplit("/", 1)
+    if path_parts and path_parts[-1].casefold() == "responses":
+        parent = path_parts[0]
+        models_path = f"{parent}/models" if parent else "/models"
+    else:
+        models_path = f"{upstream_path}/models" if upstream_path else "/models"
+
+    request_query = urllib.parse.urlsplit(request_target).query
+    if upstream.query and request_query:
+        query = f"{upstream.query}&{request_query}"
+    else:
+        query = upstream.query or request_query
+    return urllib.parse.urlunsplit(
+        (upstream.scheme, upstream.netloc, models_path, query, "")
+    )
+
+
+def _forwarded_response_headers(headers: Any) -> dict[str, str]:
+    """Return response headers safe to copy across the local proxy."""
+
+    connection_tokens: set[str] = set()
+    for key, value in headers.items():
+        if key.casefold() == "connection":
+            connection_tokens.update(
+                token.strip().casefold()
+                for token in str(value).split(",")
+                if token.strip()
+            )
+    excluded = HOP_BY_HOP_HEADERS | connection_tokens
+    return {
+        key: value
+        for key, value in headers.items()
+        if key.casefold() not in excluded
+    }
+
+
 def _request_headers(
-    headers: dict[str, str], token: str, account_id: str | None
+    headers: dict[str, str],
+    token: str,
+    account_id: str | None,
+    *,
+    accept: str = "text/event-stream, application/json",
+    content_type: str | None = "application/json",
 ) -> dict[str, str]:
     excluded = {
         "authorization",
+        "chatgpt-account-id",
         "content-length",
         "connection",
         "host",
@@ -131,8 +198,12 @@ def _request_headers(
     forwarded["Authorization"] = f"Bearer {token}"
     if account_id:
         forwarded["ChatGPT-Account-Id"] = account_id
-    forwarded.setdefault("Accept", "text/event-stream, application/json")
-    forwarded.setdefault("Content-Type", "application/json")
+    if not any(key.casefold() == "accept" for key in forwarded):
+        forwarded["Accept"] = accept
+    if content_type and not any(
+        key.casefold() == "content-type" for key in forwarded
+    ):
+        forwarded["Content-Type"] = content_type
     return forwarded
 
 
@@ -261,6 +332,32 @@ class PoolResponsesProxy:
         )
         return self.opener(request, timeout=self.config.request_timeout)
 
+    def _open_models_upstream(
+        self,
+        request_target: str,
+        headers: dict[str, str],
+        reservation: PoolReservation,
+    ) -> Any:
+        token, account_id = _profile_auth(
+            self.store.profile_path(self.provider, reservation.profile)
+        )
+        if not token:
+            raise AiAuthSwitchError(
+                f"profile {reservation.profile!r} has no access token"
+            )
+        request = urllib.request.Request(
+            _models_upstream_url(self.config.upstream_url, request_target),
+            headers=_request_headers(
+                headers,
+                token,
+                account_id,
+                accept="application/json",
+                content_type=None,
+            ),
+            method="GET",
+        )
+        return self.opener(request, timeout=self.config.request_timeout)
+
     def _profile_auth_fingerprint(self, profile: str) -> str | None:
         try:
             return sha256_file(self.store.profile_path(self.provider, profile))
@@ -295,6 +392,150 @@ class PoolResponsesProxy:
             )
         status, response_headers = metadata[0]
         return ProxyResponse(status, response_headers, b"".join(chunks))
+
+    def forward_models(
+        self,
+        headers: dict[str, str],
+        *,
+        request_target: str = "/v1/models",
+    ) -> ProxyResponse:
+        """Fetch the Codex model catalog through one pool account.
+
+        Model discovery is a unary GET request, but it follows the same
+        account-failover policy as Responses requests.  The upstream model
+        catalog is account-aware, so forwarding it through a selected profile
+        keeps the catalog and subsequent Responses credentials consistent.
+        """
+
+        last_retry_response: tuple[int, dict[str, str], bytes] | None = None
+        for attempt in range(self.config.max_retries + 1):
+            try:
+                reservation = self._reserve(None, migrate=attempt > 0)
+            except AiAuthSwitchError:
+                if last_retry_response is not None:
+                    status, response_headers, body = last_retry_response
+                    return ProxyResponse(status, response_headers, body)
+                raise
+
+            response = None
+            auth_fingerprint = self._profile_auth_fingerprint(reservation.profile)
+            try:
+                try:
+                    response = self._open_models_upstream(
+                        request_target, headers, reservation
+                    )
+                    status_value = getattr(response, "status", None)
+                    status = int(
+                        status_value if status_value is not None else response.getcode()
+                    )
+                    response_headers = _forwarded_response_headers(response.headers)
+                    body = response.read(MAX_REQUEST_BYTES)
+                except AiAuthSwitchError as exc:
+                    self.coordinator.mark_failure(
+                        reservation.profile,
+                        "auth",
+                        str(exc),
+                        auth_fingerprint=auth_fingerprint,
+                    )
+                    if attempt < self.config.max_retries:
+                        continue
+                    return ProxyResponse(
+                        503,
+                        {"Content-Type": "application/json"},
+                        b'{"error":"profile authentication is unavailable"}',
+                    )
+                except urllib.error.HTTPError as exc:
+                    response = exc
+                    status = int(exc.code)
+                    response_headers = _forwarded_response_headers(exc.headers or {})
+                    body = exc.read(MAX_REQUEST_BYTES)
+                    if (
+                        status in RETRYABLE_STATUS_CODES
+                        and attempt < self.config.max_retries
+                    ):
+                        last_retry_response = (status, response_headers, body)
+                        kind = "401" if status == 401 else "upstream"
+                        self.coordinator.mark_failure(
+                            reservation.profile,
+                            kind,
+                            f"upstream HTTP {status}",
+                            auth_fingerprint=auth_fingerprint,
+                        )
+                        continue
+                    if status in RETRYABLE_STATUS_CODES:
+                        kind = "401" if status == 401 else "upstream"
+                        self.coordinator.mark_failure(
+                            reservation.profile,
+                            kind,
+                            f"upstream HTTP {status}",
+                            auth_fingerprint=auth_fingerprint,
+                        )
+                    return ProxyResponse(status, response_headers, body)
+                except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                    reason = str(getattr(exc, "reason", exc))
+                    self.coordinator.mark_failure(
+                        reservation.profile,
+                        "network",
+                        reason,
+                        auth_fingerprint=auth_fingerprint,
+                    )
+                    if attempt < self.config.max_retries:
+                        continue
+                    return ProxyResponse(
+                        502,
+                        {"Content-Type": "application/json"},
+                        b'{"error":"upstream request failed"}',
+                    )
+
+                if status in RETRYABLE_STATUS_CODES and attempt < self.config.max_retries:
+                    last_retry_response = (status, response_headers, body)
+                    kind = "401" if status == 401 else "upstream"
+                    self.coordinator.mark_failure(
+                        reservation.profile,
+                        kind,
+                        f"upstream HTTP {status}",
+                        auth_fingerprint=auth_fingerprint,
+                    )
+                    continue
+                if status in RETRYABLE_STATUS_CODES:
+                    kind = "401" if status == 401 else "upstream"
+                    self.coordinator.mark_failure(
+                        reservation.profile,
+                        kind,
+                        f"upstream HTTP {status}",
+                        auth_fingerprint=auth_fingerprint,
+                    )
+                else:
+                    self.coordinator.mark_success(reservation.profile)
+                return ProxyResponse(status, response_headers, body)
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                # A transport error while reading a model catalog is
+                # recoverable before any response is sent to the caller.
+                reason = str(getattr(exc, "reason", exc))
+                self.coordinator.mark_failure(
+                    reservation.profile,
+                    "network",
+                    reason,
+                    auth_fingerprint=auth_fingerprint,
+                )
+                if attempt < self.config.max_retries:
+                    continue
+                return ProxyResponse(
+                    502,
+                    {"Content-Type": "application/json"},
+                    b'{"error":"upstream request failed"}',
+                )
+            finally:
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
+                self.coordinator.release(reservation)
+
+        return ProxyResponse(
+            502,
+            {"Content-Type": "application/json"},
+            b'{"error":"upstream request failed"}',
+        )
 
     def stream(
         self,
@@ -346,12 +587,7 @@ class PoolResponsesProxy:
                     status = int(
                         status_value if status_value is not None else response.getcode()
                     )
-                    response_headers = {
-                        key: value
-                        for key, value in response.headers.items()
-                        if key.casefold()
-                        not in {"content-length", "transfer-encoding", "connection"}
-                    }
+                    response_headers = _forwarded_response_headers(response.headers)
                 except AiAuthSwitchError as exc:
                     last_error = str(exc)
                     self.coordinator.mark_failure(
@@ -367,12 +603,7 @@ class PoolResponsesProxy:
                     return
                 except urllib.error.HTTPError as exc:
                     status = int(exc.code)
-                    response_headers = {
-                        key: value
-                        for key, value in (exc.headers or {}).items()
-                        if key.casefold()
-                        not in {"content-length", "transfer-encoding", "connection"}
-                    }
+                    response_headers = _forwarded_response_headers(exc.headers or {})
                     error_body = exc.read(MAX_REQUEST_BYTES)
                     if (
                         status in RETRYABLE_STATUS_CODES
@@ -460,14 +691,57 @@ class PoolResponsesProxy:
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
 
-            def do_POST(self) -> None:
-                if self.path not in {"/responses", "/v1/responses"}:
+            def _authorized(self) -> bool:
+                return (
+                    self.headers.get("Authorization", "")
+                    == f"Bearer {proxy.listener_token}"
+                )
+
+            def _send_unary_response(
+                self, response: ProxyResponse, *, include_body: bool = True
+            ) -> None:
+                self.close_connection = True
+                self.send_response(response.status)
+                for key, value in response.headers.items():
+                    if key.casefold() not in {"server", "date"}:
+                        self.send_header(key, value)
+                self.send_header("Content-Length", str(len(response.body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                if include_body:
+                    self.wfile.write(response.body)
+                    self.wfile.flush()
+
+            def _do_models(self, *, include_body: bool) -> None:
+                path = urllib.parse.urlsplit(self.path).path
+                if path not in {"/models", "/v1/models"}:
                     self.send_error(404)
                     return
-                if (
-                    self.headers.get("Authorization", "")
-                    != f"Bearer {proxy.listener_token}"
-                ):
+                if not self._authorized():
+                    self.send_error(401)
+                    return
+                try:
+                    response = proxy.forward_models(
+                        {key: value for key, value in self.headers.items()},
+                        request_target=self.path,
+                    )
+                except AiAuthSwitchError as exc:
+                    self.send_error(503, str(exc))
+                    return
+                self._send_unary_response(response, include_body=include_body)
+
+            def do_GET(self) -> None:
+                self._do_models(include_body=True)
+
+            def do_HEAD(self) -> None:
+                self._do_models(include_body=False)
+
+            def do_POST(self) -> None:
+                path = urllib.parse.urlsplit(self.path).path
+                if path not in {"/responses", "/v1/responses"}:
+                    self.send_error(404)
+                    return
+                if not self._authorized():
                     self.send_error(401)
                     return
                 raw_length = self.headers.get("Content-Length")
