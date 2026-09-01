@@ -503,7 +503,7 @@ class PoolAppServer:
                             )
                         try:
                             self._handle_client_message(message)
-                        except Exception as exc:
+                        except Exception as exc:  # noqa: BLE001 - isolate one client request
                             # A single backend write/selection failure must
                             # not terminate the shared pool process.  Return a
                             # JSON-RPC error for this request and let later

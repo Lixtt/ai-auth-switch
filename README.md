@@ -60,6 +60,11 @@ Version 0.6.7 prevents expired usage snapshots from retaining stale plan
 labels, recovers persisted sticky routes when their account becomes
 unhealthy, and restores accounts automatically after their credentials rotate.
 
+Version 0.6.8 proxies Codex model discovery (`GET /models` and
+`GET /v1/models`) through the account pool, preserves model-catalog metadata,
+and hardens app-server control routing, backend recovery, truncated stream
+handling, and IPv6 loopback listeners.
+
 To install the newest source directly from the official GitHub repository:
 
 ```bash
@@ -296,6 +301,11 @@ The router binds only to `127.0.0.1` by default and rejects non-loopback
 listeners. It never writes access tokens to logs or forwards the local pool
 token upstream. Use `--pool-upstream-url` only for an explicitly compatible
 Responses endpoint; the default is the Codex ChatGPT backend.
+
+The router also serves `GET`/`HEAD` requests for `/models` and `/v1/models`.
+It derives the sibling model-catalog endpoint from the configured Responses
+upstream, forwards the request through a healthy paid profile, and retries
+transient account or transport failures before returning the catalog.
 
 Once the router is running and `AI_AUTH_SWITCH_POOL_TOKEN` is exported, start
 the regular `codex` command. In this mode the pool custom provider chooses the
