@@ -87,6 +87,7 @@ class ResponsesProxyConfig:
     max_retries: int = 2
     request_timeout: float = 120.0
     token_file: Path | None = None
+    auto_refresh: bool = True
 
 
 @dataclass(frozen=True)
@@ -303,6 +304,11 @@ class PoolResponsesProxy:
         profiles = self.store.list_profiles(self.provider)
         if not profiles:
             raise AiAuthSwitchError("no saved Codex profiles")
+        if self.config.auto_refresh:
+            # Renew expired access tokens before the usage probe, so an account
+            # that merely went stale is not reported as unusable and dropped
+            # from the pool.
+            self.coordinator.refresh_stale_auth(profiles)
         usages = self.usage_fetcher(
             ((profile.name, profile.path) for profile in profiles),
             timeout=self.config.usage_timeout,

@@ -565,6 +565,44 @@ class PoolServerTests(unittest.TestCase):
             self.assertEqual(error["id"], 2)
             self.assertEqual(error["error"]["code"], -32005)
 
+    def test_expired_tokens_are_refreshed_before_usage_is_probed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            store.write_profile_content(
+                provider, "a", json.dumps({"tokens": {"access_token": "token-a"}})
+            )
+            order: list[str] = []
+
+            def usage_fetcher(_profiles, **_kwargs):
+                order.append("usage")
+                return {"a": usage(80)}
+
+            def make_server(auto_refresh: bool) -> PoolAppServer:
+                server = PoolAppServer(
+                    store,
+                    provider,
+                    command=("fake-codex",),
+                    config=PoolServerConfig(auto_refresh=auto_refresh),
+                    input_stream=io.StringIO(),
+                    output_stream=io.StringIO(),
+                    backend_factory=FakeBackend,
+                    usage_fetcher=usage_fetcher,
+                )
+                server.coordinator.refresh_stale_auth = (
+                    lambda profiles, **_kwargs: order.append("refresh") or []
+                )
+                return server
+
+            make_server(True)._profiles_and_usage()
+            self.assertEqual(order, ["refresh", "usage"])
+
+            order.clear()
+            make_server(False)._profiles_and_usage()
+            self.assertEqual(order, ["usage"])
+
 
 if __name__ == "__main__":
     unittest.main()

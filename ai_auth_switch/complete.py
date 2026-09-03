@@ -127,6 +127,7 @@ def _dynamic_candidates(
             ("remove",),
             ("default",),
             ("bind",),
+            ("refresh",),
         )
         and dest == "name"
         and provider

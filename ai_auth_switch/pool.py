@@ -3,14 +3,27 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import threading
 import time
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from ai_auth_switch.errors import AiAuthSwitchError
 from ai_auth_switch.providers import Provider
+from ai_auth_switch.refresh import (
+    FAILED,
+    LOGIN_REQUIRED,
+    REFRESHED,
+    SKIPPED,
+    RefreshResult,
+    has_refresh_token,
+    needs_refresh,
+    refresh_profile,
+    supports_refresh,
+)
 from ai_auth_switch.store import AuthStore, ProfileInfo, sha256_file
 from ai_auth_switch.usage import AccountUsage, is_free_plan
 from ai_auth_switch.utils import atomic_write
@@ -26,6 +39,14 @@ class PoolPolicy:
     cooldown_seconds: float = 30.0
     max_failure_cooldown_seconds: float = 900.0
     stale_lease_seconds: float = 24 * 60 * 60
+    # Automatic token refresh runs on the request path, so it uses a shorter
+    # timeout than an interactive `auth refresh`, gives up waiting after a
+    # fixed budget, and backs off after transient failures instead of retrying
+    # on every request.
+    refresh_timeout_seconds: float = 10.0
+    refresh_budget_seconds: float = 8.0
+    refresh_retry_backoff_seconds: float = 60.0
+    refresh_workers: int = 4
 
 
 @dataclass(frozen=True)
@@ -293,6 +314,14 @@ class PoolCoordinator:
         self.policy = policy or PoolPolicy()
         self.pid_is_alive = pid_is_alive
         self.path = pool_state_path(store, provider)
+        # Refresh bookkeeping is shared by the server's request threads.
+        # Transient failures are throttled in memory so an outage cannot add a
+        # token-exchange attempt to every request, and in-flight names are
+        # tracked so a slow exchange is never started twice.
+        self._refresh_lock = threading.Lock()
+        self._refresh_retry_after: dict[str, float] = {}
+        self._refresh_inflight: set[str] = set()
+        self._refresh_pool: ThreadPoolExecutor | None = None
 
     def load(self) -> PoolState:
         try:
@@ -420,6 +449,120 @@ class PoolCoordinator:
             )
         )
         return candidates
+
+    def refresh_stale_auth(
+        self,
+        profiles: Iterable[ProfileInfo],
+        *,
+        now: float | None = None,
+        refresher: Callable[..., RefreshResult] = refresh_profile,
+    ) -> list[RefreshResult]:
+        """Refresh saved credentials whose access token has already expired.
+
+        A pooled account usually falls out of the pool for a boring reason:
+        nothing exchanged its refresh token in time. Doing that exchange here
+        restores the account without an interactive login. Credentials the
+        server has permanently retired are recorded against the fingerprint
+        they failed under, so they cost one attempt rather than one per
+        request, and become eligible again after a login replaces the file.
+
+        This runs on the request path, so it never blocks longer than
+        ``refresh_budget_seconds``. Exchanges still running when the budget
+        expires are left to finish in the background and record their outcome;
+        the request proceeds with whatever accounts are usable right now, and
+        a late arrival simply becomes eligible for the next request.
+        """
+        timestamp = time.time() if now is None else now
+        if not supports_refresh(self.provider):
+            return []
+        state = self.load()
+        pending: list[tuple[ProfileInfo, str | None]] = []
+        with self._refresh_lock:
+            for profile in profiles:
+                if profile.name in self._refresh_inflight:
+                    continue
+                retry_after = self._refresh_retry_after.get(profile.name)
+                if retry_after is not None and retry_after > timestamp:
+                    continue
+                if not needs_refresh(profile.path, now=timestamp):
+                    continue
+                if not has_refresh_token(profile.path):
+                    continue
+                fingerprint = self._profile_auth_fingerprint(profile)
+                health = state.health.get(profile.name)
+                if (
+                    health is not None
+                    and health.status == AUTH_EXPIRED
+                    and health.auth_fingerprint is not None
+                    and health.auth_fingerprint == fingerprint
+                ):
+                    continue
+                pending.append((profile, fingerprint))
+                # Claim the profile and charge the backoff before the exchange
+                # starts. A hung endpoint must not be dialled again by every
+                # request that arrives while the first attempt is still open.
+                self._refresh_inflight.add(profile.name)
+                self._refresh_retry_after[profile.name] = (
+                    timestamp + self.policy.refresh_retry_backoff_seconds
+                )
+        if not pending:
+            return []
+
+        def run(item: tuple[ProfileInfo, str | None]) -> RefreshResult:
+            profile, fingerprint = item
+            try:
+                result = refresher(
+                    self.store,
+                    self.provider,
+                    profile.name,
+                    timeout=self.policy.refresh_timeout_seconds,
+                    now=timestamp,
+                )
+            except AiAuthSwitchError as exc:
+                result = RefreshResult(profile.name, FAILED, str(exc))
+            except Exception as exc:  # noqa: BLE001 - a worker must never die silently
+                result = RefreshResult(profile.name, FAILED, f"{type(exc).__name__}: {exc}")
+            self._record_refresh(result, fingerprint)
+            return result
+
+        # The token exchange is network work, so it runs outside the pool lock
+        # on a shared executor rather than one thread pool per request.
+        futures = [self._refresh_executor().submit(run, item) for item in pending]
+        done, _pending_futures = wait(
+            futures, timeout=self.policy.refresh_budget_seconds
+        )
+        return [future.result() for future in futures if future in done]
+
+    def _refresh_executor(self) -> ThreadPoolExecutor:
+        with self._refresh_lock:
+            if self._refresh_pool is None:
+                self._refresh_pool = ThreadPoolExecutor(
+                    max_workers=max(1, self.policy.refresh_workers),
+                    thread_name_prefix="ais-refresh",
+                )
+            return self._refresh_pool
+
+    def _record_refresh(self, result: RefreshResult, fingerprint: str | None) -> None:
+        """Apply one refresh outcome; runs on the worker thread that produced it."""
+        try:
+            if result.status == LOGIN_REQUIRED:
+                # Remember the credential this failed under so the account is
+                # skipped until a login replaces the file.
+                self.mark_failure(
+                    result.profile,
+                    "auth",
+                    f"refresh token rejected: {result.message}",
+                    auth_fingerprint=fingerprint,
+                )
+            if result.status in (REFRESHED, SKIPPED):
+                # The auth file changed, so `_health_after_auth_change` restores
+                # the account on the next selection and the fingerprint-keyed
+                # usage cache re-fetches its quota.
+                with self._refresh_lock:
+                    self._refresh_retry_after.pop(result.profile, None)
+        finally:
+            with self._refresh_lock:
+                self._refresh_inflight.discard(result.profile)
 
     def reserve(
         self,

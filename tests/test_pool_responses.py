@@ -1192,6 +1192,43 @@ class PoolResponsesTests(unittest.TestCase):
                 local.shutdown()
                 local.server_close()
 
+    def test_expired_tokens_are_refreshed_before_usage_is_probed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            provider = CodexProvider(root / ".codex", ["fake-codex"])
+            store = AuthStore(root / "store")
+            provider.active_auth_path.parent.mkdir(parents=True)
+            store.write_profile_content(
+                provider, "a", json.dumps({"tokens": {"access_token": "token-a"}})
+            )
+            order: list[str] = []
+
+            def usage_fetcher(_profiles, **_kwargs):
+                order.append("usage")
+                return {"a": usage(80)}
+
+            def make_proxy(auto_refresh: bool) -> PoolResponsesProxy:
+                proxy = PoolResponsesProxy(
+                    store,
+                    provider,
+                    config=ResponsesProxyConfig(
+                        max_retries=0, auto_refresh=auto_refresh
+                    ),
+                    opener=lambda request, **_kwargs: FakeResponse(b""),
+                    usage_fetcher=usage_fetcher,
+                )
+                proxy.coordinator.refresh_stale_auth = (
+                    lambda profiles, **_kwargs: order.append("refresh") or []
+                )
+                return proxy
+
+            make_proxy(True)._profiles_and_usage()
+            self.assertEqual(order, ["refresh", "usage"])
+
+            order.clear()
+            make_proxy(False)._profiles_and_usage()
+            self.assertEqual(order, ["usage"])
+
 
 if __name__ == "__main__":
     unittest.main()

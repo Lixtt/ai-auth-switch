@@ -27,6 +27,7 @@ class PoolServerConfig:
     usage_cache_ttl: float = 60.0
     refresh_usage: bool = False
     backend_timeout: float = 10.0
+    auto_refresh: bool = True
 
 
 @dataclass
@@ -90,6 +91,11 @@ class PoolAppServer:
         profiles = self.store.list_profiles(self.provider)
         if not profiles:
             raise AiAuthSwitchError("no saved Codex profiles")
+        if self.config.auto_refresh:
+            # Renew expired access tokens before the usage probe, so an account
+            # that merely went stale is not reported as unusable and dropped
+            # from the pool.
+            self.coordinator.refresh_stale_auth(profiles)
         usages = self.usage_fetcher(
             ((profile.name, profile.path) for profile in profiles),
             timeout=self.config.usage_timeout,

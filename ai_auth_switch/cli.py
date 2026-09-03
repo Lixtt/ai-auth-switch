@@ -856,6 +856,81 @@ def _cmd_auth_sync(args: argparse.Namespace) -> int:
     return 1 if any(not result.ok for result in results) else 0
 
 
+def _cmd_auth_refresh(args: argparse.Namespace) -> int:
+    from ai_auth_switch.refresh import (
+        LOGIN_REQUIRED,
+        REFRESHED,
+        refresh_profiles,
+        result_to_dict,
+        supports_refresh,
+    )
+
+    provider = _provider_from_args(args)
+    store = _store_from_args(args)
+    if not supports_refresh(provider):
+        raise AiAuthSwitchError(f"token refresh is not supported for {provider.id}")
+    known = {profile.name for profile in store.list_profiles(provider)}
+    if args.all:
+        names = sorted(known)
+    elif args.name:
+        names = [sanitize_profile_name(name) for name in args.name]
+        unknown = [name for name in names if name not in known]
+        if unknown:
+            raise AiAuthSwitchError(
+                f"unknown {provider.id} profile(s): {', '.join(unknown)}"
+            )
+    else:
+        current = store.current_profile(provider)
+        if current is None:
+            raise AiAuthSwitchError(
+                "no active profile; name one explicitly or pass --all"
+            )
+        names = [current.name]
+    if not names:
+        raise AiAuthSwitchError(f"no saved {provider.id} profiles")
+
+    results = refresh_profiles(
+        store,
+        provider,
+        names,
+        force=args.force,
+        timeout=args.timeout,
+        workers=args.workers,
+    )
+    if args.json:
+        print(
+            json.dumps(
+                {"results": [result_to_dict(result) for result in results]},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    else:
+        width = max(len(result.profile) for result in results)
+        status_width = max(len(result.status) for result in results)
+        for result in results:
+            print(
+                f"{result.profile:{width}}  "
+                f"{result.status:<{status_width}}  {result.message}"
+            )
+        needs_login = [r.profile for r in results if r.status == LOGIN_REQUIRED]
+        if needs_login:
+            print()
+            print(
+                "these refresh tokens are permanently rejected; log in again with "
+                f"`ais auth login {provider.id} <profile>`:"
+            )
+            for name in needs_login:
+                print(f"  {name}")
+    changed = {result.profile for result in results if result.status == REFRESHED}
+    active = store.current_profile(provider)
+    if active is not None and active.name in changed and not args.json:
+        # The active auth file is a symlink to the profile, so it already
+        # carries the new token; dependent tools copy it and must be resynced.
+        _sync_after_auth_change(args, provider, store, profile_name=active.name)
+    return 0 if all(result.status != LOGIN_REQUIRED for result in results) else 1
+
+
 def _cmd_auth_remove(args: argparse.Namespace) -> int:
     provider = _provider_from_args(args)
     store = _store_from_args(args)
@@ -1301,6 +1376,7 @@ def _cmd_pool_app_server(args: argparse.Namespace) -> int:
             usage_cache_ttl=args.pool_usage_cache_ttl,
             refresh_usage=args.pool_refresh_usage,
             backend_timeout=args.pool_backend_timeout,
+            auto_refresh=args.pool_auto_refresh,
         ),
     )
     return server.run()
@@ -1326,6 +1402,7 @@ def _cmd_pool_responses(args: argparse.Namespace) -> int:
             token_file=Path(args.pool_token_file).expanduser()
             if args.pool_token_file
             else None,
+            auto_refresh=args.pool_auto_refresh,
         ),
     )
     address = f"http://{args.pool_host}:{args.pool_port}"
@@ -1572,6 +1649,49 @@ def build_parser(
         help="Do not restart openclaw-gateway.service after sync.",
     )
     auth_sync.set_defaults(func=_cmd_auth_sync)
+
+    auth_refresh = auth_sub.add_parser(
+        "refresh",
+        help="Exchange saved Codex refresh tokens for new access tokens.",
+    )
+    auth_refresh.add_argument(
+        "provider", nargs=opt(None), choices=SUPPORTED_PROVIDERS
+    )
+    auth_refresh.add_argument(
+        "name",
+        nargs="*",
+        help="Profiles to refresh. Defaults to the active profile.",
+    )
+    auth_refresh.add_argument(
+        "--all",
+        action="store_true",
+        help="Refresh every saved profile.",
+    )
+    auth_refresh.add_argument(
+        "--force",
+        action="store_true",
+        help="Refresh even when the stored access token has not expired.",
+    )
+    auth_refresh.add_argument(
+        "--timeout",
+        type=_positive_float,
+        default=30.0,
+        metavar="SECONDS",
+        help="Per-profile token request timeout (default: 30).",
+    )
+    auth_refresh.add_argument(
+        "--workers",
+        type=_positive_int,
+        default=4,
+        metavar="COUNT",
+        help="Maximum concurrent token requests (default: 4).",
+    )
+    auth_refresh.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit stable machine-readable JSON.",
+    )
+    auth_refresh.set_defaults(func=_cmd_auth_refresh)
 
     auth_login = auth_sub.add_parser(
         "login", help="Run provider login and save the result."
@@ -1937,6 +2057,12 @@ def build_parser(
         default=10.0,
         metavar="SECONDS",
     )
+    pool_server.add_argument(
+        "--no-auto-refresh",
+        dest="pool_auto_refresh",
+        action="store_false",
+        help="Do not renew expired access tokens while routing requests.",
+    )
     pool_server.set_defaults(func=_cmd_pool_app_server)
 
     pool_responses = pool_sub.add_parser(
@@ -1966,6 +2092,12 @@ def build_parser(
     pool_responses.add_argument("--pool-max-retries", type=_nonnegative_int, default=2)
     pool_responses.add_argument(
         "--pool-request-timeout", type=_positive_float, default=120.0, metavar="SECONDS"
+    )
+    pool_responses.add_argument(
+        "--no-auto-refresh",
+        dest="pool_auto_refresh",
+        action="store_false",
+        help="Do not renew expired access tokens while routing requests.",
     )
     pool_responses.set_defaults(func=_cmd_pool_responses)
 

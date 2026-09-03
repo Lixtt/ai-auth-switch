@@ -65,6 +65,10 @@ Version 0.6.8 proxies Codex model discovery (`GET /models` and
 and hardens app-server control routing, backend recovery, truncated stream
 handling, and IPv6 loopback listeners.
 
+Version 0.6.9 adds `auth refresh codex`, which exchanges a saved profile's
+OAuth refresh token without an interactive login, and lets the account pool
+renew merely-stale credentials on the request path before it probes usage.
+
 To install the newest source directly from the official GitHub repository:
 
 ```bash
@@ -136,8 +140,8 @@ Results are cached for 60 seconds. Use `--refresh-usage` to bypass the cache,
 `--usage-cache-ttl` to tune it, `--usage-timeout` for slow networks, and
 `--usage-workers` to limit concurrency. A failure for one account is shown
 inline without hiding results for the other accounts. The command deliberately
-does not refresh expired OAuth tokens; run that profile through Codex or log in
-again so rotating credentials remain coordinated safely.
+does not refresh expired OAuth tokens; use `auth refresh` below when an account
+reports an expired login.
 
 Authentication-expired responses replace any cached plan/quota snapshot, so an
 expired account is shown as unavailable instead of retaining a stale `pro` or
@@ -150,6 +154,42 @@ when `--usage` is also present:
 ```bash
 ai-auth-switch auth list codex --usage --json
 ```
+
+### Refreshing expired Codex tokens
+
+A saved account normally stops working for a boring reason: its access token
+expired because nothing exchanged the refresh token in time. `auth refresh`
+does that exchange without an interactive login:
+
+```bash
+ais auth refresh codex                        # the active profile
+ais auth refresh codex someone@example.com    # named profiles
+ais auth refresh codex --all                  # every saved profile
+```
+
+Only profiles whose access token has expired (or is within five minutes of
+expiring) are contacted; the rest are reported as `skipped`. Pass `--force` to
+exchange regardless, `--timeout` for slow networks, and `--workers` to limit
+concurrency.
+
+```text
+someone@example.com  refreshed       new access token valid until 2026-09-14T03:08:24+08:00
+other@example.com    skipped         access token still valid until 2026-09-10T13:50:27+08:00
+stale@example.com    login_required  Your session has ended. Please log in again. (refresh_token_invalidated)
+```
+
+Each exchange holds that profile's update lock, because refresh tokens rotate
+and two concurrent exchanges would leave one process holding a token the server
+has already retired. The write-back reuses the same identity guard as profile
+reconciliation: a token response belonging to a different account never
+overwrites the profile, and is preserved under `backups/codex/rejected/` for
+inspection.
+
+A `login_required` result means the server has permanently retired that refresh
+token (`invalid_grant`, `invalid_refresh_token`, `refresh_token_invalidated`,
+`refresh_token_reused`). No retry can fix it; run `ais auth login codex
+<profile>`. The command exits non-zero when any profile needs a login, and
+`--json` emits the same results for scripting.
 
 ### Automatic Codex profile selection for CLI runs
 
